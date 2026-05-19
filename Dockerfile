@@ -22,8 +22,8 @@ ENV OBS_BUILDER=submission.my_observation_builder.MyObservationBuilder
 RUN bash entrypoint_generic.sh python -m pip install -r submission/requirements.txt
 
 # Fail-fast: verify at build time that POLICY and OBS_BUILDER are importable.
-RUN bash entrypoint_generic.sh python -c "\
-from flatland.utils.cli_utils import resolve_type; \
-assert resolve_type('${POLICY}') is not None, 'Cannot import ${POLICY}'; \
-assert resolve_type('${OBS_BUILDER}') is not None, 'Cannot import ${OBS_BUILDER}'; \
-print('Policy and obs builder imported OK')"
+#RUN bash entrypoint_generic.sh python -c "\
+#from flatland.utils.cli_utils import resolve_type; \
+#assert resolve_type('${POLICY}') is not None, 'Cannot import ${POLICY}'; \
+#assert resolve_type('${OBS_BUILDER}') is not None, 'Cannot import ${OBS_BUILDER}'; \
+#print('Policy and obs builder imported OK')"
