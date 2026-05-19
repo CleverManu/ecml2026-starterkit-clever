@@ -1,5 +1,4 @@
-# HERE: add your pip dependencies here
-
-
-# flatland-rl @ git+https://github.com/flatland-association/flatland-rl.git@main
-flatland-rl==4.2.5
+# Runtime dependencies for inference inside the competition Docker image.
+# Flatland itself is provided by the base image (ghcr.io/flatland-association/flatland-baselines).
+# numpy is also a dependency of flatland-rl and therefore already present.
+torch>=2.0

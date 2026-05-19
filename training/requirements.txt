@@ -1,0 +1,7 @@
+# Dependencies for training (NOT shipped in the submission Docker image).
+# Install with: pip install -r training/requirements.txt
+flatland-rl>=4.2.5
+torch>=2.0
+numpy
+tensorboard
+tqdm
