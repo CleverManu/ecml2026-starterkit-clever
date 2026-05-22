@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from my_orga.model import ActorCritic
+from submission.model import ActorCritic
 from training.rollout import Batch
 
 

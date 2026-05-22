@@ -8,7 +8,7 @@ GitHub Action.
 ## Repository layout
 
 ```
-my_orga/                          # Submission code (copied into Docker image)
+submission/                          # Submission code (copied into Docker image)
   __init__.py
   my_observation_builder.py       # Flattened+normalized TreeObs (depth=2, 252 features)
   my_policy.py                    # Policy.act_many implementation that loads checkpoint.pt
@@ -58,7 +58,7 @@ gradient.
 
 ```bash
 # Submission-side (also enough to use the trained policy locally)
-pip install -r my_orga/requirements.txt
+pip install -r submission/requirements.txt
 pip install flatland-rl>=4.2.5
 
 # Training-side (additionally)
@@ -113,10 +113,10 @@ competition evaluator reports.
 
 ```bash
 # Copy the checkpoint you want to submit into the submission folder.
-cp runs/baseline/checkpoints/best.pt my_orga/checkpoint.pt
+cp runs/baseline/checkpoints/best.pt submission/checkpoint.pt
 ```
 
-That's it -- `my_orga/checkpoint.pt` is the only artefact the policy needs at
+That's it -- `submission/checkpoint.pt` is the only artefact the policy needs at
 inference time. The Docker image picks it up automatically.
 
 ### 5. Build & test the Docker image locally (optional)
@@ -140,8 +140,8 @@ The starter-kit ships a `docker` GitHub Action that builds and pushes the image
 to GHCR. Workflow:
 
 1. Fork [`flatland-association/ecml2026-starterkit`](https://github.com/flatland-association/ecml2026-starterkit).
-2. Drop the contents of this repo into the fork (replacing `my_orga/` and the
-   `Dockerfile`). Train and copy `checkpoint.pt` into `my_orga/` as above, then
+2. Drop the contents of this repo into the fork (replacing `submission/` and the
+   `Dockerfile`). Train and copy `checkpoint.pt` into `submission/` as above, then
    commit and push.
 3. Trigger the `docker` workflow under your fork's **Actions** tab.
 4. After it succeeds, copy the image URL from
@@ -217,11 +217,11 @@ attention, MAPPO, curriculum).
 ## Troubleshooting
 
 **"checkpoint not found" warning at container start.** You forgot to copy
-`checkpoint.pt` into `my_orga/`. The policy falls back to random weights so the
+`checkpoint.pt` into `submission/`. The policy falls back to random weights so the
 container still runs, but submissions will be useless.
 
-**Docker build fails on "Cannot import my_orga.my_policy.MyPolicy".** Make sure
-`my_orga/__init__.py` exists and that you didn't introduce a top-level import
+**Docker build fails on "Cannot import submission.my_policy.MyPolicy".** Make sure
+`submission/__init__.py` exists and that you didn't introduce a top-level import
 that breaks under the container's Python version.
 
 **Submission accepted but scores `0%`.** Check that the same observation builder

@@ -215,7 +215,7 @@ class MyObservationBuilderV2(MyObservationBuilder):
         7. malfunction time remaining for this agent / 50.0 (capped at 1.0)
 
     All values are clipped to ``[-1, 1]``. Use this builder by setting the
-    Docker env var ``OBS_BUILDER=my_orga.my_observation_builder.MyObservationBuilderV2``.
+    Docker env var ``OBS_BUILDER=submission.my_observation_builder.MyObservationBuilderV2``.
     """
 
     def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:

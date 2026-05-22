@@ -22,7 +22,7 @@ import torch
 
 from flatland.envs.rail_env import RailEnv
 
-from my_orga.model import ActorCritic
+from submission.model import ActorCritic
 
 
 @dataclass

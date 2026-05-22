@@ -22,13 +22,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from yaml import warnings
 
-from my_orga.model import ActorCritic, NetConfig, save_checkpoint, load_checkpoint
-from my_orga.my_observation_builder import get_obs_dim, get_obs_dim_v2
+from submission.model import ActorCritic, NetConfig, save_checkpoint, load_checkpoint
+from submission.my_observation_builder import get_obs_dim, get_obs_dim_v2
 
 from training.env_factory import make_training_env, DEFAULT_SCENARIO
 from training.ppo import PPOConfig, PPOTrainer
 from training.rollout import RolloutCollector
+
+import warnrnis
+warnings.filterwarnings("ignore", message=".*Could not find path.*")
 
 
 def parse_args() -> argparse.Namespace:

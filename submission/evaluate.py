@@ -32,9 +32,9 @@ import torch
 from flatland.envs.persistence import RailEnvPersister
 from flatland.envs.rewards import ECML2026Rewards
 
-from my_orga.model import load_checkpoint
-from my_orga.my_observation_builder import MyObservationBuilder
-from my_orga.my_policy import MyPolicy
+from submission.model import load_checkpoint
+from submission.my_observation_builder import MyObservationBuilder
+from submission.my_policy import MyPolicy
 
 
 def _read_metadata(metadata_csv: Path) -> List[dict]:

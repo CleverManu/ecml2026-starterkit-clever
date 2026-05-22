@@ -23,8 +23,8 @@ import torch
 
 from flatland.core.policy import Policy
 
-from my_orga.model import ActorCritic, NetConfig, load_checkpoint
-from my_orga.my_observation_builder import get_obs_dim
+from submission.model import ActorCritic, NetConfig, load_checkpoint
+from submission.my_observation_builder import get_obs_dim
 
 CHECKPOINT_FILENAME = "checkpoint.pt"
 

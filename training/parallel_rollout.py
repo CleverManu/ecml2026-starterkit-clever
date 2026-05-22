@@ -31,7 +31,7 @@ import numpy as np
 import torch
 from torch.multiprocessing import set_start_method as _set_start_method
 
-from my_orga.model import ActorCritic, NetConfig
+from submission.model import ActorCritic, NetConfig
 from training.env_factory import make_training_env
 from training.rollout import Batch, _PerAgentTrace, _compute_gae
 
