@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from submission.model import ActorCritic
+from my_orga.model import ActorCritic
 from training.rollout import Batch
 
 
@@ -26,6 +26,8 @@ from training.rollout import Batch
 class PPOConfig:
     lr: float = 3e-4
     clip_eps: float = 0.2
+    value_clip_eps: float = 0.2  # Clip value updates the same way the policy is clipped.
+                                 # Set to 0 to disable.
     value_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
@@ -65,6 +67,7 @@ class PPOTrainer:
                 mb_obs = batch.obs[mb]
                 mb_act = batch.actions[mb]
                 mb_logp_old = batch.log_probs[mb]
+                mb_val_old = batch.values[mb]
                 mb_adv = advantages[mb]
                 mb_ret = batch.returns[mb]
 
@@ -76,7 +79,19 @@ class PPOTrainer:
                                       1 + self.cfg.clip_eps) * mb_adv
                 policy_loss = -torch.min(unclipped, clipped).mean()
 
-                value_loss = 0.5 * (value - mb_ret).pow(2).mean()
+                # Value clipping: prevent the value function from changing too fast
+                # in any single update step. Standard PPO trick.
+                if self.cfg.value_clip_eps > 0:
+                    v_clipped = mb_val_old + torch.clamp(
+                        value - mb_val_old,
+                        -self.cfg.value_clip_eps, self.cfg.value_clip_eps,
+                    )
+                    v_loss_unclipped = (value - mb_ret).pow(2)
+                    v_loss_clipped = (v_clipped - mb_ret).pow(2)
+                    value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                else:
+                    value_loss = 0.5 * (value - mb_ret).pow(2).mean()
+
                 entropy_mean = entropy.mean()
 
                 loss = (

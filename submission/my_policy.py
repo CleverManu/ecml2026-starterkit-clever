@@ -6,10 +6,10 @@ by ``flatland-trajectory-generate-from-policy`` via the ``POLICY`` env var:
 
 ::
 
-    ENV POLICY=submission.my_policy.MyPolicy
+    ENV POLICY=my_orga.my_policy.MyPolicy
 
 At construction time the policy loads the checkpoint that was shipped inside the
-Docker image (``submission/checkpoint.pt``). If no checkpoint is found, the policy
+Docker image (``my_orga/checkpoint.pt``). If no checkpoint is found, the policy
 falls back to a freshly initialized random network rather than crashing, so the
 container is still runnable for debugging.
 """
@@ -23,8 +23,8 @@ import torch
 
 from flatland.core.policy import Policy
 
-from submission.model import ActorCritic, NetConfig, load_checkpoint
-from submission.my_observation_builder import get_obs_dim
+from my_orga.model import ActorCritic, NetConfig, load_checkpoint
+from my_orga.my_observation_builder import get_obs_dim
 
 CHECKPOINT_FILENAME = "checkpoint.pt"
 

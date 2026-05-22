@@ -15,7 +15,7 @@ from flatland.envs.persistence import RailEnvPersister
 from flatland.envs.rail_env import RailEnv
 from flatland.envs.rewards import ECML2026Rewards
 
-from submission.my_observation_builder import MyObservationBuilder
+from submission.my_observation_builder import MyObservationBuilder, MyObservationBuilderV2
 from training.sampling import sampling_env_generator
 
 
@@ -27,6 +27,7 @@ def make_training_env(
     scenario_path: str = DEFAULT_SCENARIO,
     line_length: int = 2,
     scene: Optional[str] = None,
+    obs_version: str = "v1",
 ) -> RailEnv:
     """
     Build a training environment.
@@ -43,8 +44,14 @@ def make_training_env(
     scene
         Optional restriction to a subset of stations (``"scene_1"`` ... ``"scene_5"``).
         ``None`` is equivalent to ``"scene_5"`` (all stations).
+    obs_version
+        ``"v1"`` (default) -> ``MyObservationBuilder`` (252 features).
+        ``"v2"`` -> ``MyObservationBuilderV2`` with 8 extra global features (260).
     """
-    obs_builder = MyObservationBuilder()
+    if obs_version == "v2":
+        obs_builder = MyObservationBuilderV2()
+    else:
+        obs_builder = MyObservationBuilder()
     env = RailEnvPersister.load_new(
         scenario_path,
         obs_builder=obs_builder,

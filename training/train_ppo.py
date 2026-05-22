@@ -11,7 +11,7 @@ Usage
     # Full CPU baseline (overnight on a laptop)
     python -m training.train_ppo --total-steps 5000000 --rollout-steps 1024 --log-dir runs/baseline
 
-Run from the project root so the ``submission`` and ``training`` packages resolve.
+Run from the project root so the ``my_orga`` and ``training`` packages resolve.
 """
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from submission.model import ActorCritic, NetConfig, save_checkpoint, load_checkpoint
-from submission.my_observation_builder import get_obs_dim
+from my_orga.model import ActorCritic, NetConfig, save_checkpoint, load_checkpoint
+from my_orga.my_observation_builder import get_obs_dim, get_obs_dim_v2
 
 from training.env_factory import make_training_env, DEFAULT_SCENARIO
 from training.ppo import PPOConfig, PPOTrainer
@@ -43,6 +43,18 @@ def parse_args() -> argparse.Namespace:
                    help="Maximum waypoints per train (2 = simple A->B).")
     p.add_argument("--scene", type=str, default=None,
                    help="Station-set restriction: scene_1..scene_5 or omit for all.")
+    p.add_argument("--obs-version", type=str, default="v1", choices=["v1", "v2"],
+                   help="v1 = tree obs only (252 dims, default). "
+                        "v2 = tree obs + 8 global features (260 dims).")
+    p.add_argument("--num-envs", type=int, default=1,
+                   help="Number of parallel env workers. >1 enables multi-process "
+                        "collection (recommended for CPU training).")
+    p.add_argument("--shape-progress", type=float, default=0.0,
+                   help="If > 0, add a small reward each step for shrinking "
+                        "distance-to-target. Typical values: 0.5 to 2.0.")
+    p.add_argument("--anneal-lr", action="store_true",
+                   help="Linearly anneal learning rate from initial to 0 over "
+                        "--total-steps. Standard PPO practice.")
     p.add_argument("--hidden", type=int, default=256, help="Hidden width.")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)
@@ -83,27 +95,55 @@ def main() -> None:
     except ImportError:
         print("(TensorBoard not installed; logging to stdout only.)")
 
-    env = make_training_env(
-        scenario_path=args.scenario, line_length=args.line_length, scene=args.scene
+    env_kwargs = dict(
+        scenario_path=args.scenario,
+        line_length=args.line_length,
+        scene=args.scene,
+        obs_version=args.obs_version,
     )
-    # Reset once to pin down obs_dim from a real obs; sanity check vs. constant.
-    env.reset(random_seed=args.seed)
-    obs_dim = get_obs_dim()
-    print(f"Env: {env.width}x{env.height}, n_agents={env.get_num_agents()}, "
-          f"obs_dim={obs_dim}, max_episode_steps={env._max_episode_steps}")
+
+    # Resolve observation dim from the chosen builder version.
+    obs_dim = get_obs_dim_v2() if args.obs_version == "v2" else get_obs_dim()
 
     if args.resume and os.path.isfile(args.resume):
         print(f"Resuming from {args.resume}")
         model = load_checkpoint(args.resume, map_location="cpu")
+        if model.cfg.obs_dim != obs_dim:
+            raise SystemExit(
+                f"Checkpoint expects obs_dim={model.cfg.obs_dim} but selected "
+                f"obs version gives {obs_dim}. Use --obs-version "
+                f"{'v2' if model.cfg.obs_dim == get_obs_dim_v2() else 'v1'} to match."
+            )
     else:
         model = ActorCritic(NetConfig(obs_dim=obs_dim, hidden=args.hidden))
     model.to("cpu").train()
 
-    collector = RolloutCollector(
-        env=env, model=model, rollout_steps=args.rollout_steps,
-        gamma=args.gamma, gae_lambda=args.gae_lambda,
-        reward_scale=args.reward_scale,
-    )
+    # Single env (for setup info) + collector selection.
+    setup_env = make_training_env(**env_kwargs)
+    setup_env.reset(random_seed=args.seed)
+    print(f"Env: {setup_env.width}x{setup_env.height}, n_agents={setup_env.get_num_agents()}, "
+          f"obs_dim={obs_dim}, max_episode_steps={setup_env._max_episode_steps}, "
+          f"num_envs={args.num_envs}")
+    del setup_env
+
+    if args.num_envs > 1:
+        from training.parallel_rollout import ParallelRolloutCollector
+        collector = ParallelRolloutCollector(
+            n_envs=args.num_envs, env_kwargs=env_kwargs,
+            model=model, rollout_steps=args.rollout_steps,
+            gamma=args.gamma, gae_lambda=args.gae_lambda,
+            reward_scale=args.reward_scale,
+            progress_reward_coef=args.shape_progress,
+            base_seed=args.seed,
+        )
+    else:
+        collector = RolloutCollector(
+            env=make_training_env(**env_kwargs),
+            model=model, rollout_steps=args.rollout_steps,
+            gamma=args.gamma, gae_lambda=args.gae_lambda,
+            reward_scale=args.reward_scale,
+            progress_reward_coef=args.shape_progress,
+        )
     trainer = PPOTrainer(
         model=model,
         cfg=PPOConfig(
@@ -119,6 +159,13 @@ def main() -> None:
     best_success_rate = -1.0
 
     while global_step < args.total_steps:
+        # Optional linear LR anneal from initial value to 0.
+        if args.anneal_lr:
+            frac = 1.0 - (global_step / args.total_steps)
+            new_lr = args.lr * max(frac, 0.0)
+            for g in trainer.optimizer.param_groups:
+                g["lr"] = new_lr
+
         t0 = time.time()
         batch = collector.collect()
         collect_time = time.time() - t0
@@ -183,6 +230,8 @@ def main() -> None:
         print(f"Best success rate during training: {best_success_rate:.2%}")
     if tb_writer is not None:
         tb_writer.close()
+    if hasattr(collector, "close"):
+        collector.close()
 
 
 if __name__ == "__main__":

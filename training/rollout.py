@@ -22,7 +22,7 @@ import torch
 
 from flatland.envs.rail_env import RailEnv
 
-from submission.model import ActorCritic
+from my_orga.model import ActorCritic
 
 
 @dataclass
@@ -73,6 +73,9 @@ class RolloutCollector:
     gae_lambda: float = 0.95
     reward_scale: float = 100.0  # ECML2026Rewards has very large terminal penalties;
                                  # scaling keeps the value head's targets reasonable.
+    progress_reward_coef: float = 0.0  # If > 0, give a small per-step reward for
+                                       # reducing min-distance to target. Helps with the
+                                       # sparse-reward problem early in training.
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
 
     # Stats from the most recent collection
@@ -91,6 +94,10 @@ class RolloutCollector:
         self.success_rates = []
 
         obs_dict, info = self.env.reset()
+        # Track previous distance-to-target per agent for progress shaping.
+        prev_distance: Dict[int, float] = {}
+        if self.progress_reward_coef > 0:
+            prev_distance = self._distances_to_target()
         ep_return = 0.0
         ep_length = 0
         steps_done = 0
@@ -133,10 +140,24 @@ class RolloutCollector:
             # Scale by ``reward_scale`` so value targets stay numerically reasonable;
             # the policy gradient is invariant to scale after advantage normalization.
             inv_scale = 1.0 / self.reward_scale
+
+            # Optional progress shaping: reward each agent for shrinking its
+            # min-distance to target since the previous step. Magnitude is tiny
+            # vs terminal penalties so it doesn't dominate the true objective.
+            shaped: Dict[int, float] = {}
+            if self.progress_reward_coef > 0:
+                current_distance = self._distances_to_target()
+                for h in handles:
+                    prev = prev_distance.get(h, float("inf"))
+                    cur = current_distance.get(h, float("inf"))
+                    if prev != float("inf") and cur != float("inf"):
+                        shaped[h] = self.progress_reward_coef * (prev - cur)
+                prev_distance = current_distance
+
             for h in handles:
                 r = float(rewards.get(h, 0.0))
                 ep_return += r  # logged in raw units for human readability
-                r_scaled = r * inv_scale
+                r_scaled = (r + shaped.get(h, 0.0)) * inv_scale
                 if traces[h].rewards.__len__() < len(traces[h].actions):
                     traces[h].rewards.append(r_scaled)
                 elif traces[h].actions:
@@ -168,6 +189,8 @@ class RolloutCollector:
                 traces = defaultdict(_PerAgentTrace)
                 if steps_done < self.rollout_steps:
                     obs_dict, info = self.env.reset()
+                    if self.progress_reward_coef > 0:
+                        prev_distance = self._distances_to_target()
 
         # End of rollout window: bootstrap unfinished traces from current value estimate.
         for h, tr in traces.items():
@@ -216,3 +239,27 @@ class RolloutCollector:
         b_val.append(np.asarray(tr.values, dtype=np.float32))
         b_adv.append(adv.astype(np.float32))
         b_ret.append(ret.astype(np.float32))
+
+    def _distances_to_target(self) -> Dict[int, float]:
+        """Read each active agent's shortest-path distance to its target."""
+        out: Dict[int, float] = {}
+        try:
+            distance_map = self.env.distance_map.get()
+        except Exception:
+            return out
+        for agent in self.env.agents:
+            if agent.state == 6:  # DONE
+                out[agent.handle] = 0.0
+                continue
+            pos = agent.position
+            if pos is None:
+                # Not on map yet: use initial position so departure isn't credited.
+                pos = agent.initial_position
+            direction = agent.direction if agent.direction is not None else agent.initial_direction
+            try:
+                d = float(distance_map[agent.handle, pos[0], pos[1], direction])
+                if np.isfinite(d):
+                    out[agent.handle] = d
+            except (IndexError, TypeError):
+                pass
+        return out

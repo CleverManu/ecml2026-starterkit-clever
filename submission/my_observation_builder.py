@@ -182,3 +182,81 @@ class MyObservationBuilder(TreeObsForRailEnv):
         if tree is None:
             return np.zeros(get_obs_dim(self.max_depth), dtype=np.float32)
         return flatten_normalized(tree, self.max_depth)
+
+
+# ---------------------------------------------------------------------------
+# V2: Tree observation + 8 global/per-agent features.
+# ---------------------------------------------------------------------------
+# Tree obs is purely local (current cell + a few branches). The policy benefits
+# from a handful of global state features so it knows things like "I'm running
+# late" or "most other agents have already arrived". These are cheap to compute
+# from `self.env` after every step.
+
+N_GLOBAL_FEATURES: int = 8
+
+
+def get_obs_dim_v2(tree_depth: int = TREE_DEPTH) -> int:
+    """Observation dim when global features are appended."""
+    return get_obs_dim(tree_depth) + N_GLOBAL_FEATURES
+
+
+class MyObservationBuilderV2(MyObservationBuilder):
+    """
+    Tree observation + 8 normalized global/per-agent state features.
+
+    Features appended at the end of the flat vector:
+        0. fraction of total episode steps elapsed
+        1. fraction of agents that have arrived
+        2. fraction of agents currently moving or stopped on map
+        3. fraction of agents currently malfunctioning
+        4. fraction of agents still waiting to depart
+        5. (earliest_departure - elapsed) / max_steps  -- "how soon should I leave"
+        6. (latest_arrival   - elapsed) / max_steps  -- "how much time do I have"
+        7. malfunction time remaining for this agent / 50.0 (capped at 1.0)
+
+    All values are clipped to ``[-1, 1]``. Use this builder by setting the
+    Docker env var ``OBS_BUILDER=my_orga.my_observation_builder.MyObservationBuilderV2``.
+    """
+
+    def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:
+        tree_part = super().get(handle)
+        extras = self._global_features(handle)
+        return np.concatenate([tree_part, extras]).astype(np.float32)
+
+    def _global_features(self, handle: int) -> np.ndarray:
+        env = self.env
+        agents = env.agents
+        n_agents = max(len(agents), 1)
+        elapsed = float(env._elapsed_steps)
+        max_steps = max(float(env._max_episode_steps), 1.0)
+
+        # Aggregate state counts.
+        n_arrived = sum(1 for a in agents if a.state == 6)         # DONE
+        n_on_map = sum(1 for a in agents if a.state in (3, 4))     # MOVING, STOPPED
+        n_malfunc = sum(1 for a in agents if a.state == 5)         # MALFUNCTION
+        n_waiting = sum(1 for a in agents if a.state in (0, 1, 2)) # WAITING, READY_TO_DEPART, MALF_OFF_MAP
+
+        # Per-agent timing.
+        agent = agents[handle]
+        ed = agent.earliest_departure if agent.earliest_departure is not None else 0
+        la = agent.latest_arrival if agent.latest_arrival is not None else int(max_steps)
+        time_to_dep = (ed - elapsed) / max_steps
+        time_to_arr = (la - elapsed) / max_steps
+
+        mf_remaining = 0.0
+        try:
+            mf_remaining = float(agent.malfunction_handler.malfunction_down_counter) / 50.0
+        except AttributeError:
+            pass
+
+        feats = np.array([
+            elapsed / max_steps,
+            n_arrived / n_agents,
+            n_on_map / n_agents,
+            n_malfunc / n_agents,
+            n_waiting / n_agents,
+            time_to_dep,
+            time_to_arr,
+            mf_remaining,
+        ], dtype=np.float32)
+        return np.clip(feats, -1.0, 1.0)
