@@ -31,7 +31,7 @@ from training.env_factory import make_training_env, DEFAULT_SCENARIO
 from training.ppo import PPOConfig, PPOTrainer
 from training.rollout import RolloutCollector
 
-import warnrnis
+import warnings
 warnings.filterwarnings("ignore", message=".*Could not find path.*")
 
 
