@@ -162,69 +162,92 @@ def main() -> None:
     start_time = time.time()
     best_success_rate = -1.0
 
-    while global_step < args.total_steps:
-        # Optional linear LR anneal from initial value to 0.
-        if args.anneal_lr:
-            frac = 1.0 - (global_step / args.total_steps)
-            new_lr = args.lr * max(frac, 0.0)
-            for g in trainer.optimizer.param_groups:
-                g["lr"] = new_lr
+    try:
+        while global_step < args.total_steps:
+            # Optional linear LR anneal from initial value to 0.
+            if args.anneal_lr:
+                frac = 1.0 - (global_step / args.total_steps)
+                new_lr = args.lr * max(frac, 0.0)
+                for g in trainer.optimizer.param_groups:
+                    g["lr"] = new_lr
 
-        t0 = time.time()
-        batch = collector.collect()
-        collect_time = time.time() - t0
+            t0 = time.time()
+            batch = collector.collect()
+            collect_time = time.time() - t0
 
-        global_step += args.rollout_steps
-        update_idx += 1
+            global_step += args.rollout_steps
+            update_idx += 1
 
-        t0 = time.time()
-        metrics = trainer.update(batch)
-        update_time = time.time() - t0
+            t0 = time.time()
+            metrics = trainer.update(batch)
+            update_time = time.time() - t0
 
-        ep_ret = float(np.mean(collector.episode_returns)) if collector.episode_returns else 0.0
-        ep_len = float(np.mean(collector.episode_lengths)) if collector.episode_lengths else 0.0
-        succ = float(np.mean(collector.success_rates)) if collector.success_rates else 0.0
-        sps = args.rollout_steps / max(collect_time + update_time, 1e-6)
+            ep_ret = float(np.mean(collector.episode_returns)) if collector.episode_returns else 0.0
+            ep_len = float(np.mean(collector.episode_lengths)) if collector.episode_lengths else 0.0
+            succ = float(np.mean(collector.success_rates)) if collector.success_rates else 0.0
+            sps = args.rollout_steps / max(collect_time + update_time, 1e-6)
 
-        elapsed = time.time() - start_time
-        print(
-            f"[upd {update_idx:5d} | step {global_step:>9d} | {elapsed/60:6.1f} min] "
-            f"ep_ret={ep_ret:8.2f} ep_len={ep_len:6.1f} succ={succ:.2%} "
-            f"| pl={metrics['policy_loss']:+.3f} vl={metrics['value_loss']:.3f} "
-            f"H={metrics['entropy']:.3f} kl={metrics['approx_kl']:+.3f} "
-            f"clip={metrics['clip_frac']:.2%} n={metrics['n_samples']:5d} "
-            f"| sps={sps:5.1f}"
-        )
-
-        if tb_writer is not None:
-            tb_writer.add_scalar("rollout/ep_return_mean", ep_ret, global_step)
-            tb_writer.add_scalar("rollout/ep_length_mean", ep_len, global_step)
-            tb_writer.add_scalar("rollout/success_rate", succ, global_step)
-            tb_writer.add_scalar("rollout/n_episodes", len(collector.episode_returns), global_step)
-            tb_writer.add_scalar("ppo/policy_loss", metrics["policy_loss"], global_step)
-            tb_writer.add_scalar("ppo/value_loss", metrics["value_loss"], global_step)
-            tb_writer.add_scalar("ppo/entropy", metrics["entropy"], global_step)
-            tb_writer.add_scalar("ppo/approx_kl", metrics["approx_kl"], global_step)
-            tb_writer.add_scalar("ppo/clip_fraction", metrics["clip_frac"], global_step)
-            tb_writer.add_scalar("ppo/n_samples", metrics["n_samples"], global_step)
-            tb_writer.add_scalar("perf/steps_per_second", sps, global_step)
-
-        if update_idx % args.checkpoint_every == 0:
-            path = ckpt_dir / f"ckpt_upd{update_idx:05d}.pt"
-            save_checkpoint(model, str(path),
-                            extra={"global_step": global_step, "update": update_idx})
-            # Also overwrite latest.pt for convenience.
-            save_checkpoint(model, str(ckpt_dir / "latest.pt"),
-                            extra={"global_step": global_step, "update": update_idx})
-            print(f"  saved {path}")
-
-        if collector.success_rates and succ > best_success_rate:
-            best_success_rate = succ
-            save_checkpoint(
-                model, str(ckpt_dir / "best.pt"),
-                extra={"global_step": global_step, "update": update_idx,
-                       "success_rate": succ},
+            elapsed = time.time() - start_time
+            print(
+                f"[upd {update_idx:5d} | step {global_step:>9d} | {elapsed/60:6.1f} min] "
+                f"ep_ret={ep_ret:8.2f} ep_len={ep_len:6.1f} succ={succ:.2%} "
+                f"| pl={metrics['policy_loss']:+.3f} vl={metrics['value_loss']:.3f} "
+                f"H={metrics['entropy']:.3f} kl={metrics['approx_kl']:+.3f} "
+                f"clip={metrics['clip_frac']:.2%} n={metrics['n_samples']:5d} "
+                f"| sps={sps:5.1f}"
             )
+
+            if tb_writer is not None:
+                tb_writer.add_scalar("rollout/ep_return_mean", ep_ret, global_step)
+                tb_writer.add_scalar("rollout/ep_length_mean", ep_len, global_step)
+                tb_writer.add_scalar("rollout/success_rate", succ, global_step)
+                tb_writer.add_scalar("rollout/n_episodes", len(collector.episode_returns), global_step)
+                tb_writer.add_scalar("ppo/policy_loss", metrics["policy_loss"], global_step)
+                tb_writer.add_scalar("ppo/value_loss", metrics["value_loss"], global_step)
+                tb_writer.add_scalar("ppo/entropy", metrics["entropy"], global_step)
+                tb_writer.add_scalar("ppo/approx_kl", metrics["approx_kl"], global_step)
+                tb_writer.add_scalar("ppo/clip_fraction", metrics["clip_frac"], global_step)
+                tb_writer.add_scalar("ppo/n_samples", metrics["n_samples"], global_step)
+                tb_writer.add_scalar("perf/steps_per_second", sps, global_step)
+
+            if update_idx % args.checkpoint_every == 0:
+                path = ckpt_dir / f"ckpt_upd{update_idx:05d}.pt"
+                save_checkpoint(model, str(path),
+                                extra={"global_step": global_step, "update": update_idx})
+                # Also overwrite latest.pt for convenience.
+                save_checkpoint(model, str(ckpt_dir / "latest.pt"),
+                                extra={"global_step": global_step, "update": update_idx})
+                print(f"  saved {path}")
+
+            if collector.success_rates and succ > best_success_rate:
+                best_success_rate = succ
+                save_checkpoint(
+                    model, str(ckpt_dir / "best.pt"),
+                    extra={"global_step": global_step, "update": update_idx,
+                           "success_rate": succ},
+                )
+
+    except (KeyboardInterrupt, Exception) as e:
+        # Emergency save: don't lose progress to OOM-killed workers, ctrl-C,
+        # transient pipe errors, etc. The user can resume from emergency.pt.
+        emergency_path = ckpt_dir / "emergency.pt"
+        try:
+            save_checkpoint(
+                model, str(emergency_path),
+                extra={"global_step": global_step, "update": update_idx,
+                       "crashed": True, "reason": type(e).__name__},
+            )
+            print(f"\n!!! Training interrupted by {type(e).__name__}: {e}")
+            print(f"!!! Emergency checkpoint saved -> {emergency_path}")
+            print(f"!!! Resume with:  --resume {emergency_path}")
+        except Exception as save_err:
+            print(f"!!! Could not save emergency checkpoint: {save_err}")
+        if hasattr(collector, "close"):
+            try:
+                collector.close()
+            except Exception:
+                pass
+        raise
 
     # Final save
     save_checkpoint(model, str(ckpt_dir / "final.pt"),

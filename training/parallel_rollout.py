@@ -22,6 +22,7 @@ Usage from training script:
 """
 from __future__ import annotations
 
+import gc
 import os
 from dataclasses import dataclass, field
 from multiprocessing import Pipe, Process
@@ -117,6 +118,11 @@ def _worker_loop(
                     "episode_lengths": result["episode_lengths"],
                     "success_rates": result["success_rates"],
                 })
+                # Drop the big intermediate dict and run an explicit GC pass.
+                # Flatland's env caches (distance map, shortest-path predictor)
+                # can hold MBs that take a while to be reclaimed otherwise.
+                del result
+                gc.collect()
             else:
                 conn.send(("error", f"unknown command: {cmd}"))
     except Exception as e:  # pragma: no cover - debugging only
@@ -238,6 +244,17 @@ def _collect(
                           finished_obs, finished_actions,
                           finished_log_probs, finished_values,
                           finished_advantages, finished_returns)
+
+    # If the rollout window happened to end on the same step the episode
+    # terminated, the env is now in a done state and would raise
+    # "Episode is done, cannot call step()" on the next collect(). Reset
+    # here so the carry-over obs_dict/info point at a fresh episode.
+    # We only reset in this case; otherwise we keep mid-episode state so
+    # the next collect continues the same episode (correct on-policy behaviour).
+    if env.dones.get("__all__", False):
+        obs_dict, info = env.reset()
+        ep_return = 0.0
+        ep_length = 0
 
     obs_dim = model.cfg.obs_dim
     obs_arr = (np.concatenate(finished_obs) if finished_obs
