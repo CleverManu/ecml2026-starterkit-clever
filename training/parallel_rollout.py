@@ -32,7 +32,9 @@ import numpy as np
 import torch
 from torch.multiprocessing import set_start_method as _set_start_method
 
+from submission.action_mask import get_action_mask
 from submission.model import ActorCritic, NetConfig
+from submission.my_observation_builder import extract_mask_from_obs
 from training.env_factory import make_training_env
 from training.rollout import Batch, _PerAgentTrace, _compute_gae
 
@@ -97,12 +99,15 @@ def _worker_loop(
                 gae_lambda: float = payload["gae_lambda"]
                 reward_scale: float = payload["reward_scale"]
                 progress_coef: float = payload.get("progress_coef", 0.0)
+                arrival_bonus: float = payload.get("arrival_bonus", 0.0)
+                use_mask: bool = payload.get("use_action_mask", False)
 
                 # Run the rollout and ship back the batch + episode metrics.
                 result = _collect(
                     env=env, model=model, n_steps=n_steps,
                     gamma=gamma, gae_lambda=gae_lambda,
                     reward_scale=reward_scale, progress_coef=progress_coef,
+                    arrival_bonus=arrival_bonus, use_mask=use_mask,
                     obs_dict=obs_dict, info=info,
                     ep_return=ep_return, ep_length=ep_length,
                 )
@@ -134,6 +139,7 @@ def _worker_loop(
 
 def _collect(
     env, model, n_steps, gamma, gae_lambda, reward_scale, progress_coef,
+    arrival_bonus, use_mask,
     obs_dict, info, ep_return, ep_length,
 ) -> Dict[str, Any]:
     """Pure rollout function used by workers. Mirrors RolloutCollector.collect."""
@@ -142,6 +148,7 @@ def _collect(
     traces = defaultdict(_PerAgentTrace)
     finished_advantages, finished_returns = [], []
     finished_obs, finished_actions, finished_log_probs, finished_values = [], [], [], []
+    finished_masks: List[np.ndarray] = []
 
     episode_returns: List[float] = []
     episode_lengths: List[int] = []
@@ -150,6 +157,7 @@ def _collect(
     prev_distance: Dict[int, float] = {}
     if progress_coef > 0:
         prev_distance = _distances_to_target(env)
+    prev_done: Dict[int, bool] = {a.handle: (a.state == 6) for a in env.agents}
 
     inv_scale = 1.0 / reward_scale
     steps_done = 0
@@ -165,8 +173,21 @@ def _collect(
         if need:
             batch_obs = np.stack([np.asarray(obs_dict[h], dtype=np.float32) for h in need])
             obs_t = torch.from_numpy(batch_obs)
+
+            mask_t = None
+            batch_masks = None
+            if use_mask:
+                embedded = extract_mask_from_obs(batch_obs)
+                if embedded is not None:
+                    batch_masks = embedded
+                else:
+                    batch_masks = np.stack([get_action_mask(env, h) for h in need])
+                mask_t = torch.from_numpy(batch_masks)
+
             with torch.no_grad():
                 logits, values_t = model(obs_t)
+                if mask_t is not None:
+                    logits = model._apply_mask(logits, mask_t)
                 dist = torch.distributions.Categorical(logits=logits)
                 sampled = dist.sample()
                 log_probs = dist.log_prob(sampled)
@@ -180,6 +201,8 @@ def _collect(
                 tr.actions.append(int(sampled_np[j]))
                 tr.log_probs.append(float(log_probs_np[j]))
                 tr.values.append(float(values_np[j]))
+                if batch_masks is not None:
+                    tr.masks.append(batch_masks[j])
 
         next_obs, rewards, dones, next_info = env.step(actions_dict)
         steps_done += 1
@@ -194,6 +217,14 @@ def _collect(
                 if prev != float("inf") and cur != float("inf"):
                     shaped[h] = progress_coef * (prev - cur)
             prev_distance = current_distance
+
+        if arrival_bonus > 0:
+            for a in env.agents:
+                h = a.handle
+                is_done = (a.state == 6)
+                if is_done and not prev_done.get(h, False):
+                    shaped[h] = shaped.get(h, 0.0) + arrival_bonus
+                prev_done[h] = is_done
 
         for h in handles:
             r = float(rewards.get(h, 0.0))
@@ -221,13 +252,15 @@ def _collect(
                 _flush_to_buffers(tr, 0.0, gamma, gae_lambda,
                                   finished_obs, finished_actions,
                                   finished_log_probs, finished_values,
-                                  finished_advantages, finished_returns)
+                                  finished_advantages, finished_returns,
+                                  finished_masks)
             traces = defaultdict(_PerAgentTrace)
 
             if steps_done < n_steps:
                 obs_dict, info = env.reset()
                 if progress_coef > 0:
                     prev_distance = _distances_to_target(env)
+                prev_done = {a.handle: (a.state == 6) for a in env.agents}
 
     # Bootstrap partial traces at end of rollout window.
     for h, tr in traces.items():
@@ -243,14 +276,11 @@ def _collect(
         _flush_to_buffers(tr, last_value, gamma, gae_lambda,
                           finished_obs, finished_actions,
                           finished_log_probs, finished_values,
-                          finished_advantages, finished_returns)
+                          finished_advantages, finished_returns,
+                          finished_masks)
 
-    # If the rollout window happened to end on the same step the episode
-    # terminated, the env is now in a done state and would raise
-    # "Episode is done, cannot call step()" on the next collect(). Reset
-    # here so the carry-over obs_dict/info point at a fresh episode.
-    # We only reset in this case; otherwise we keep mid-episode state so
-    # the next collect continues the same episode (correct on-policy behaviour).
+    # See the matching block in RolloutCollector.collect: reset if env ended
+    # exactly on the rollout boundary so next collect() can step.
     if env.dones.get("__all__", False):
         obs_dict, info = env.reset()
         ep_return = 0.0
@@ -269,6 +299,8 @@ def _collect(
                       else np.zeros(0, dtype=np.float32))
     returns_arr = (np.concatenate(finished_returns) if finished_returns
                    else np.zeros(0, dtype=np.float32))
+    masks_arr = (np.concatenate(finished_masks)
+                 if (use_mask and finished_masks) else None)
 
     return {
         "batch": {
@@ -277,6 +309,7 @@ def _collect(
             "values": values_arr.astype(np.float32),
             "advantages": advantages_arr.astype(np.float32),
             "returns": returns_arr.astype(np.float32),
+            "masks": masks_arr.astype(np.bool_) if masks_arr is not None else None,
         },
         "obs_dict": obs_dict, "info": info,
         "ep_return": ep_return, "ep_length": ep_length,
@@ -287,7 +320,7 @@ def _collect(
 
 
 def _flush_to_buffers(tr, last_value, gamma, gae_lambda,
-                     b_obs, b_act, b_lp, b_val, b_adv, b_ret):
+                     b_obs, b_act, b_lp, b_val, b_adv, b_ret, b_mask):
     while len(tr.rewards) < len(tr.actions):
         tr.rewards.append(0.0)
     adv, ret = _compute_gae(tr.rewards, tr.values, last_value, gamma, gae_lambda)
@@ -297,6 +330,8 @@ def _flush_to_buffers(tr, last_value, gamma, gae_lambda,
     b_val.append(np.asarray(tr.values, dtype=np.float32))
     b_adv.append(adv.astype(np.float32))
     b_ret.append(ret.astype(np.float32))
+    if tr.masks:
+        b_mask.append(np.stack(tr.masks).astype(np.bool_))
 
 
 def _distances_to_target(env) -> Dict[int, float]:
@@ -336,6 +371,8 @@ class ParallelRolloutCollector:
     gae_lambda: float = 0.95
     reward_scale: float = 100.0
     progress_reward_coef: float = 0.0
+    arrival_bonus: float = 0.0
+    use_action_mask: bool = False
     base_seed: int = 0
 
     # Diagnostics filled in by each collect() call.
@@ -389,6 +426,8 @@ class ParallelRolloutCollector:
                 "gae_lambda": self.gae_lambda,
                 "reward_scale": self.reward_scale,
                 "progress_coef": self.progress_reward_coef,
+                "arrival_bonus": self.arrival_bonus,
+                "use_action_mask": self.use_action_mask,
             }))
 
         # 3. Drain results.
@@ -411,11 +450,19 @@ class ParallelRolloutCollector:
 
         # 4. Concatenate batches.
         def _cat(key, dtype):
-            parts = [b[key] for b in all_batches if b[key].shape[0] > 0]
+            parts = [b[key] for b in all_batches
+                     if b.get(key) is not None and b[key].shape[0] > 0]
             if not parts:
-                shape = (0, self.model.cfg.obs_dim) if key == "obs" else (0,)
-                return np.zeros(shape, dtype=dtype)
+                if key == "obs":
+                    return np.zeros((0, self.model.cfg.obs_dim), dtype=dtype)
+                if key == "masks":
+                    return None
+                return np.zeros(0, dtype=dtype)
             return np.concatenate(parts, axis=0)
+
+        masks_arr = None
+        if self.use_action_mask:
+            masks_arr = _cat("masks", np.bool_)
 
         return Batch(
             obs=torch.from_numpy(_cat("obs", np.float32)),
@@ -424,6 +471,7 @@ class ParallelRolloutCollector:
             values=torch.from_numpy(_cat("values", np.float32)),
             advantages=torch.from_numpy(_cat("advantages", np.float32)),
             returns=torch.from_numpy(_cat("returns", np.float32)),
+            action_masks=torch.from_numpy(masks_arr) if masks_arr is not None else None,
         )
 
     def close(self) -> None:

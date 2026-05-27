@@ -9,13 +9,17 @@ same fixed grid topology.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Tuple
+
+import numpy as np
 
 from flatland.envs.persistence import RailEnvPersister
 from flatland.envs.rail_env import RailEnv
 from flatland.envs.rewards import ECML2026Rewards
 
-from submission.my_observation_builder import MyObservationBuilder, MyObservationBuilderV2
+from submission.my_observation_builder import (
+    MyObservationBuilder, MyObservationBuilderV2, MyObservationBuilderV3,
+)
 from training.sampling import sampling_env_generator
 
 
@@ -28,6 +32,7 @@ def make_training_env(
     line_length: int = 2,
     scene: Optional[str] = None,
     obs_version: str = "v1",
+    n_agents_range: Optional[Tuple[int, int]] = None,
 ) -> RailEnv:
     """
     Build a training environment.
@@ -47,8 +52,14 @@ def make_training_env(
     obs_version
         ``"v1"`` (default) -> ``MyObservationBuilder`` (252 features).
         ``"v2"`` -> ``MyObservationBuilderV2`` with 8 extra global features (260).
+    n_agents_range
+        Optional ``(low, high)`` inclusive range. If set, the env's agent count
+        is re-randomized on every reset to a uniform draw from that range.
+        Useful when competition eval covers a wide span of agent counts.
     """
-    if obs_version == "v2":
+    if obs_version == "v3":
+        obs_builder = MyObservationBuilderV3()
+    elif obs_version == "v2":
         obs_builder = MyObservationBuilderV2()
     else:
         obs_builder = MyObservationBuilder()
@@ -58,4 +69,25 @@ def make_training_env(
         rewards=ECML2026Rewards(),
     )[0]
     env = sampling_env_generator(env, line_length=line_length, scene=scene)
+    if n_agents_range is not None:
+        _enable_varied_n_agents(env, n_agents_range)
     return env
+
+
+def _enable_varied_n_agents(env: RailEnv, n_agents_range: Tuple[int, int]) -> None:
+    """Patch ``env.reset`` so each call randomizes ``number_of_agents``.
+
+    Flatland's line generator is called on every reset and respects
+    ``env.number_of_agents``, so this is all it takes to vary the count.
+    """
+    lo, hi = n_agents_range
+    if lo < 1 or hi < lo:
+        raise ValueError(f"Invalid n_agents_range={n_agents_range}; need 1 <= lo <= hi")
+
+    original_reset = env.reset
+
+    def reset_with_random_n(*args, **kwargs):
+        env.number_of_agents = int(np.random.randint(lo, hi + 1))
+        return original_reset(*args, **kwargs)
+
+    env.reset = reset_with_random_n

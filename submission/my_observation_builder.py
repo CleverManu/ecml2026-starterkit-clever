@@ -260,3 +260,59 @@ class MyObservationBuilderV2(MyObservationBuilder):
             mf_remaining,
         ], dtype=np.float32)
         return np.clip(feats, -1.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# V3: V2 + 5 action-mask features at the end.
+# ---------------------------------------------------------------------------
+# The point of having the mask *in* the observation (rather than passing it
+# alongside) is that Flatland's :class:`PolicyRunner` doesn't give the policy
+# access to the env at inference time -- but it does invoke the observation
+# builder, which has ``self.env``. So embedding the mask in the obs vector
+# is the only way masking can work consistently at both train and eval.
+
+N_MASK_FEATURES: int = 5
+
+
+def get_obs_dim_v3(tree_depth: int = TREE_DEPTH) -> int:
+    return get_obs_dim_v2(tree_depth) + N_MASK_FEATURES
+
+
+class MyObservationBuilderV3(MyObservationBuilderV2):
+    """
+    Tree obs (V1) + 8 global features (V2) + 5 action-mask features.
+
+    Total obs dim: ``252 + 8 + 5 = 265``.
+
+    The mask is computed on the same agent state the policy will see and is
+    appended as the **final 5 features**, in the order
+    ``(DO_NOTHING, MOVE_LEFT, MOVE_FORWARD, MOVE_RIGHT, STOP_MOVING)``.
+    Values are ``1.0`` for valid, ``0.0`` for invalid.
+
+    The trainer extracts these features back into a bool mask and applies
+    them in the categorical's logits, both during action selection and during
+    the PPO update. Inference (:class:`submission.my_policy.MyPolicy`) does the
+    same extraction, so masking is consistent across train and eval without
+    needing env access at inference time.
+    """
+
+    def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:
+        # Late import to avoid a cycle (action_mask -> obs_builder is fine,
+        # but obs_builder -> action_mask only when v3 is used).
+        from submission.action_mask import get_action_mask
+
+        v2_part = super().get(handle)
+        mask = get_action_mask(self.env, handle).astype(np.float32)
+        return np.concatenate([v2_part, mask]).astype(np.float32)
+
+
+def extract_mask_from_obs(obs: np.ndarray) -> Optional[np.ndarray]:
+    """Pull a (..., 5) bool mask out of a V3 obs batch, or return None.
+
+    Works on both single observations (shape ``(265,)``) and batched
+    observations (shape ``(N, 265)``). Returns ``None`` for V1/V2 obs sizes.
+    """
+    expected = get_obs_dim_v3()
+    if obs.shape[-1] != expected:
+        return None
+    return (obs[..., -N_MASK_FEATURES:] > 0.5)

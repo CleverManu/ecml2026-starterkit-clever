@@ -70,8 +70,9 @@ class PPOTrainer:
                 mb_val_old = batch.values[mb]
                 mb_adv = advantages[mb]
                 mb_ret = batch.returns[mb]
+                mb_mask = batch.action_masks[mb] if batch.action_masks is not None else None
 
-                logp, entropy, value = self.model.evaluate(mb_obs, mb_act)
+                logp, entropy, value = self.model.evaluate(mb_obs, mb_act, action_mask=mb_mask)
 
                 ratio = torch.exp(logp - mb_logp_old)
                 unclipped = ratio * mb_adv

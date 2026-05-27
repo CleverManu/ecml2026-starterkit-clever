@@ -11,9 +11,15 @@ Usage
     # Full CPU baseline (overnight on a laptop)
     python -m training.train_ppo --total-steps 5000000 --rollout-steps 1024 --log-dir runs/baseline
 
-Run from the project root so the ``my_orga`` and ``training`` packages resolve.
+Run from the project root so the ``submission`` and ``training`` packages resolve.
 """
 from __future__ import annotations
+
+# Suppress Flatland's "Could not find path" spam (happens often with
+# line_length > 2 when the line generator retries waypoint sampling).
+# Set before any flatland import so the filter is in place when those modules load.
+import warnings
+warnings.filterwarnings("ignore", message=".*Could not find path.*")
 
 import argparse
 import os
@@ -22,17 +28,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from yaml import warnings
 
 from submission.model import ActorCritic, NetConfig, save_checkpoint, load_checkpoint
-from submission.my_observation_builder import get_obs_dim, get_obs_dim_v2
+from submission.my_observation_builder import get_obs_dim, get_obs_dim_v2, get_obs_dim_v3
 
 from training.env_factory import make_training_env, DEFAULT_SCENARIO
 from training.ppo import PPOConfig, PPOTrainer
 from training.rollout import RolloutCollector
-
-import warnings
-warnings.filterwarnings("ignore", message=".*Could not find path.*")
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,15 +49,30 @@ def parse_args() -> argparse.Namespace:
                    help="Maximum waypoints per train (2 = simple A->B).")
     p.add_argument("--scene", type=str, default=None,
                    help="Station-set restriction: scene_1..scene_5 or omit for all.")
-    p.add_argument("--obs-version", type=str, default="v1", choices=["v1", "v2"],
-                   help="v1 = tree obs only (252 dims, default). "
-                        "v2 = tree obs + 8 global features (260 dims).")
+    p.add_argument("--obs-version", type=str, default="v1", choices=["v1", "v2", "v3"],
+                   help="v1 = tree obs only (252 dims). "
+                        "v2 = tree obs + 8 global features (260 dims). "
+                        "v3 = v2 + 5 action-mask features at end (265 dims). "
+                        "Pick v3 if you want action masking; requires fresh training.")
+    p.add_argument("--use-action-mask", action="store_true",
+                   help="Apply hard masking to invalid actions during training. "
+                        "Recommended only with --obs-version v3 (so masking also "
+                        "works at evaluation time).")
+    p.add_argument("--arrival-bonus", type=float, default=0.0,
+                   help="Raw-units reward given on the step an agent reaches its "
+                        "target. Dense positive feedback for the actual success "
+                        "metric. Typical: 5 to 50.")
+    p.add_argument("--n-agents-range", nargs=2, type=int, default=None,
+                   metavar=("LO", "HI"),
+                   help="If set, randomize agent count uniformly in [LO, HI] on "
+                        "every reset. Competition agent counts range 8-532, so a "
+                        "range like '10 60' is sensible for training.")
     p.add_argument("--num-envs", type=int, default=1,
                    help="Number of parallel env workers. >1 enables multi-process "
                         "collection (recommended for CPU training).")
     p.add_argument("--shape-progress", type=float, default=0.0,
                    help="If > 0, add a small reward each step for shrinking "
-                        "distance-to-target. Typical values: 0.5 to 2.0.")
+                        "distance-to-target. Typical values: 0.3 to 1.0.")
     p.add_argument("--anneal-lr", action="store_true",
                    help="Linearly anneal learning rate from initial to 0 over "
                         "--total-steps. Standard PPO practice.")
@@ -104,19 +121,31 @@ def main() -> None:
         line_length=args.line_length,
         scene=args.scene,
         obs_version=args.obs_version,
+        n_agents_range=tuple(args.n_agents_range) if args.n_agents_range else None,
     )
 
     # Resolve observation dim from the chosen builder version.
-    obs_dim = get_obs_dim_v2() if args.obs_version == "v2" else get_obs_dim()
+    if args.obs_version == "v3":
+        obs_dim = get_obs_dim_v3()
+    elif args.obs_version == "v2":
+        obs_dim = get_obs_dim_v2()
+    else:
+        obs_dim = get_obs_dim()
+
+    if args.use_action_mask and args.obs_version != "v3":
+        print(f"WARNING: --use-action-mask with --obs-version {args.obs_version}: "
+              f"masking will work during training but not at inference (the "
+              f"docker policy can't access the env). Use --obs-version v3 for "
+              f"consistent train/eval masking.")
 
     if args.resume and os.path.isfile(args.resume):
         print(f"Resuming from {args.resume}")
         model = load_checkpoint(args.resume, map_location="cpu")
         if model.cfg.obs_dim != obs_dim:
             raise SystemExit(
-                f"Checkpoint expects obs_dim={model.cfg.obs_dim} but selected "
-                f"obs version gives {obs_dim}. Use --obs-version "
-                f"{'v2' if model.cfg.obs_dim == get_obs_dim_v2() else 'v1'} to match."
+                f"Checkpoint obs_dim={model.cfg.obs_dim} doesn't match selected "
+                f"--obs-version (gives {obs_dim}). To resume, match the obs "
+                f"version used during the original training run."
             )
     else:
         model = ActorCritic(NetConfig(obs_dim=obs_dim, hidden=args.hidden))
@@ -127,7 +156,8 @@ def main() -> None:
     setup_env.reset(random_seed=args.seed)
     print(f"Env: {setup_env.width}x{setup_env.height}, n_agents={setup_env.get_num_agents()}, "
           f"obs_dim={obs_dim}, max_episode_steps={setup_env._max_episode_steps}, "
-          f"num_envs={args.num_envs}")
+          f"num_envs={args.num_envs}, n_agents_range={args.n_agents_range}, "
+          f"action_mask={args.use_action_mask}")
     del setup_env
 
     if args.num_envs > 1:
@@ -138,6 +168,8 @@ def main() -> None:
             gamma=args.gamma, gae_lambda=args.gae_lambda,
             reward_scale=args.reward_scale,
             progress_reward_coef=args.shape_progress,
+            arrival_bonus=args.arrival_bonus,
+            use_action_mask=args.use_action_mask,
             base_seed=args.seed,
         )
     else:
@@ -147,6 +179,8 @@ def main() -> None:
             gamma=args.gamma, gae_lambda=args.gae_lambda,
             reward_scale=args.reward_scale,
             progress_reward_coef=args.shape_progress,
+            arrival_bonus=args.arrival_bonus,
+            use_action_mask=args.use_action_mask,
         )
     trainer = PPOTrainer(
         model=model,

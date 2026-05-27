@@ -61,11 +61,25 @@ class ActorCritic(nn.Module):
         value = self.value_head(h).squeeze(-1)
         return logits, value
 
+    @staticmethod
+    def _apply_mask(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Set logits for invalid actions to -inf so they're never sampled.
+
+        ``mask`` is a bool tensor of the same shape as ``logits`` (True = valid).
+        We use ``-1e9`` rather than ``-inf`` to avoid NaN cascades if every
+        action happens to be masked out -- the categorical will still degenerate
+        but won't break grad computation.
+        """
+        return logits.masked_fill(~mask, -1e9)
+
     @torch.no_grad()
-    def act(self, obs: torch.Tensor, deterministic: bool = False
+    def act(self, obs: torch.Tensor, action_mask: Optional[torch.Tensor] = None,
+            deterministic: bool = False
             ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample actions plus return log-probs and state-values (no grad)."""
         logits, value = self.forward(obs)
+        if action_mask is not None:
+            logits = self._apply_mask(logits, action_mask)
         if deterministic:
             action = logits.argmax(dim=-1)
             log_prob = F.log_softmax(logits, dim=-1).gather(-1, action.unsqueeze(-1)).squeeze(-1)
@@ -75,10 +89,13 @@ class ActorCritic(nn.Module):
             log_prob = dist.log_prob(action)
         return action, log_prob, value
 
-    def evaluate(self, obs: torch.Tensor, action: torch.Tensor
+    def evaluate(self, obs: torch.Tensor, action: torch.Tensor,
+                 action_mask: Optional[torch.Tensor] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Re-evaluate log-probs / entropy / values for the PPO update."""
         logits, value = self.forward(obs)
+        if action_mask is not None:
+            logits = self._apply_mask(logits, action_mask)
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
