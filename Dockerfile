@@ -17,7 +17,7 @@ FROM ghcr.io/flatland-association/flatland-baselines:${TAG}
 COPY submission/ submission/
 
 ENV POLICY=submission.my_policy.MyPolicy
-ENV OBS_BUILDER=submission.my_observation_builder.MyObservationBuilderV2
+ENV OBS_BUILDER=submission.my_observation_builder.MyObservationBuilderV3
 
 RUN bash entrypoint_generic.sh python -m pip install -r submission/requirements.txt
 
