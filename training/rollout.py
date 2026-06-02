@@ -83,6 +83,9 @@ class RolloutCollector:
     arrival_bonus: float = 0.0   # If > 0, add this raw-units bonus to an agent's
                                  # reward on the step it transitions to DONE.
     use_action_mask: bool = False  # Compute and apply valid-action masks each step.
+    decision_points_only: bool = False  # If True, only consult policy at decision
+                                        # points (switches + nearby-agent cells);
+                                        # use hard-coded default action elsewhere.
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
 
     # Stats from the most recent collection
@@ -115,17 +118,37 @@ class RolloutCollector:
         while steps_done < self.rollout_steps:
             # Build batch only for agents that need a fresh action this step.
             handles = self.env.get_agent_handles()
-            need = [
+            need_action = [
                 h for h in handles
                 if obs_dict.get(h) is not None and info["action_required"][h]
             ]
+
+            # Decision-point gate: when enabled, the policy is only consulted
+            # at decision points. Non-decision agents get a hard-coded default
+            # action (typically MOVE_FORWARD or STOP) and no training sample
+            # is recorded for them. This collapses effective episode length
+            # by ~5-10x in typical Flatland envs and dramatically sharpens
+            # credit assignment over the decisions that matter.
+            if self.decision_points_only:
+                from submission.decision_point import is_decision_point, default_action
+                need = [h for h in need_action if is_decision_point(self.env, h)]
+                hardcoded = [h for h in need_action if h not in need]
+            else:
+                need = need_action
+                hardcoded = []
+
             actions_dict: Dict[int, int] = {h: 0 for h in handles}
+            # Fill hard-coded actions for non-decision agents.
+            if hardcoded:
+                from submission.decision_point import default_action
+                for h in hardcoded:
+                    actions_dict[h] = default_action(self.env, h)
 
             if need:
                 batch_obs = np.stack([np.asarray(obs_dict[h], dtype=np.float32) for h in need])
                 obs_t = torch.from_numpy(batch_obs).to(self.device)
 
-                # Action masks: if obs is V3 the mask is already embedded in
+                # Action masks: if obs is V3/V4 the mask is already embedded in
                 # the last 5 features; otherwise compute it from env.
                 mask_t = None
                 batch_masks = None

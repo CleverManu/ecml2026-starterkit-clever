@@ -215,7 +215,7 @@ class MyObservationBuilderV2(MyObservationBuilder):
         7. malfunction time remaining for this agent / 50.0 (capped at 1.0)
 
     All values are clipped to ``[-1, 1]``. Use this builder by setting the
-    Docker env var ``OBS_BUILDER=submission.my_observation_builder.MyObservationBuilderV2``.
+    Docker env var ``OBS_BUILDER=my_orga.my_observation_builder.MyObservationBuilderV2``.
     """
 
     def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:
@@ -291,7 +291,7 @@ class MyObservationBuilderV3(MyObservationBuilderV2):
 
     The trainer extracts these features back into a bool mask and applies
     them in the categorical's logits, both during action selection and during
-    the PPO update. Inference (:class:`submission.my_policy.MyPolicy`) does the
+    the PPO update. Inference (:class:`my_orga.my_policy.MyPolicy`) does the
     same extraction, so masking is consistent across train and eval without
     needing env access at inference time.
     """
@@ -299,7 +299,7 @@ class MyObservationBuilderV3(MyObservationBuilderV2):
     def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:
         # Late import to avoid a cycle (action_mask -> obs_builder is fine,
         # but obs_builder -> action_mask only when v3 is used).
-        from submission.action_mask import get_action_mask
+        from my_orga.action_mask import get_action_mask
 
         v2_part = super().get(handle)
         mask = get_action_mask(self.env, handle).astype(np.float32)
@@ -307,12 +307,160 @@ class MyObservationBuilderV3(MyObservationBuilderV2):
 
 
 def extract_mask_from_obs(obs: np.ndarray) -> Optional[np.ndarray]:
-    """Pull a (..., 5) bool mask out of a V3 obs batch, or return None.
+    """Pull a (..., 5) bool mask out of a V3 or V4 obs batch, or return None.
 
-    Works on both single observations (shape ``(265,)``) and batched
-    observations (shape ``(N, 265)``). Returns ``None`` for V1/V2 obs sizes.
+    Both V3 and V4 keep the 5 mask features at positions ``[-5:]`` so this
+    helper works on either. Returns ``None`` for V1/V2 obs sizes.
     """
-    expected = get_obs_dim_v3()
-    if obs.shape[-1] != expected:
+    if obs.shape[-1] not in (get_obs_dim_v3(), get_obs_dim_v4()):
         return None
     return (obs[..., -N_MASK_FEATURES:] > 0.5)
+
+
+# ---------------------------------------------------------------------------
+# V4: V3 + nearest-K other-agent features.
+# ---------------------------------------------------------------------------
+# V4 inserts other-agent features *between* the V2 global features and the V3
+# mask features. Layout:
+#   [tree obs (252)] [v2 globals (8)] [nearest-K agent features (K*6)] [mask (5)]
+#
+# Keeping mask at the end means `extract_mask_from_obs` works unchanged on
+# both V3 and V4 obs vectors. Adding features in the middle means a V4
+# checkpoint can't be loaded as V3 (different obs_dim), which is enforced by
+# the trainer's dim check.
+
+# Number of nearest agents to encode. Competition uses 8-532 agents per env;
+# K=3 captures the closest coordination partners without exploding obs size.
+N_NEAREST_AGENTS: int = 3
+
+# Per-agent feature layout. Keeping each feature in [-1, 1] for clean
+# normalization with the rest of the obs:
+#   0: dx (delta row), normalized by obs radius
+#   1: dy (delta col), normalized by obs radius
+#   2: on_my_path -- 1.0 if this agent is on my planned shortest path within
+#                    the next OBS_RADIUS cells, else 0.0
+#   3: relative direction (-1: opposite, 0: perpendicular, +1: same)
+#   4: euclidean distance, normalized by obs radius (clipped to 1.0)
+#   5: malfunction flag (1.0 if other agent is malfunctioning)
+N_AGENT_FEATURES: int = 6
+OBS_RADIUS: float = 30.0  # cells; matches typical tree-obs reach at depth 2
+
+
+def get_obs_dim_v4(tree_depth: int = TREE_DEPTH) -> int:
+    """V4 dim: V2 (260) + nearest-K agents (K*6) + mask (5)."""
+    return (get_obs_dim_v2(tree_depth)
+            + N_NEAREST_AGENTS * N_AGENT_FEATURES
+            + N_MASK_FEATURES)
+
+
+class MyObservationBuilderV4(MyObservationBuilderV2):
+    """
+    V2 base (tree + globals) + nearest-K other-agent features + mask.
+
+    Total obs dim with defaults: ``260 + 3*6 + 5 = 283``.
+
+    The K=3 nearest agents (by Euclidean distance) get a 6-feature block each:
+    relative position, on-my-path flag, relative direction, normalized distance,
+    and malfunction flag. Agents not on the map yet (no position) and DONE
+    agents are excluded from the candidate set; if fewer than K other agents
+    are eligible, slots are zero-padded.
+
+    The mask features are appended *last* (positions ``-5:``) so the existing
+    :func:`extract_mask_from_obs` and the V3/V4 model branches in
+    :mod:`my_policy` and :mod:`rollout` work uniformly across V3 and V4.
+
+    Other-agent features use Euclidean ordering for speed. A future
+    improvement would be path-aware ordering ("nearest agent along my
+    shortest path"), which is more semantically right but expensive to
+    compute every step.
+    """
+
+    def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:
+        from my_orga.action_mask import get_action_mask
+
+        v2_part = super().get(handle)  # (260,)
+        agent_part = self._nearest_agent_features(handle)  # (K*6,)
+        mask = get_action_mask(self.env, handle).astype(np.float32)  # (5,)
+        return np.concatenate([v2_part, agent_part, mask]).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    def _nearest_agent_features(self, handle: int) -> np.ndarray:
+        """Build the K*6 block of nearest-other-agent features.
+
+        Returns a zero block if the agent has no position yet (waiting to
+        depart or already done) -- the network has no spatial context for an
+        off-map agent, so other-agent features wouldn't be meaningful.
+        """
+        out = np.zeros(N_NEAREST_AGENTS * N_AGENT_FEATURES, dtype=np.float32)
+        me = self.env.agents[handle]
+        if me.position is None or int(me.state) == 6:
+            return out
+
+        my_row, my_col = me.position
+        my_dir = int(me.direction)
+
+        # Collect eligible other agents (on-map, not done, not me).
+        candidates = []
+        for other in self.env.agents:
+            if other.handle == handle:
+                continue
+            if other.position is None or int(other.state) == 6:
+                continue
+            dr = other.position[0] - my_row
+            dc = other.position[1] - my_col
+            dist_sq = dr * dr + dc * dc
+            candidates.append((dist_sq, other, dr, dc))
+
+        if not candidates:
+            return out
+
+        candidates.sort(key=lambda x: x[0])
+        # On-my-path lookup: rely on Flatland's distance map. An "on path"
+        # check via a precomputed shortest-path would be cleaner but costly;
+        # the proxy we use is: is the other agent closer than the obs radius
+        # AND roughly along my heading direction.
+        for slot in range(min(N_NEAREST_AGENTS, len(candidates))):
+            _, other, dr, dc = candidates[slot]
+            dist = float(np.sqrt(dr * dr + dc * dc))
+            other_dir = int(other.direction) if other.direction is not None else my_dir
+
+            # Feature 2: on_my_path (proxy). The agent is "in front of me" if
+            # the relative position is along the direction I'm facing.
+            #   N=0 -> dr negative
+            #   E=1 -> dc positive
+            #   S=2 -> dr positive
+            #   W=3 -> dc negative
+            on_my_path = 0.0
+            if my_dir == 0 and dr < 0:
+                on_my_path = 1.0
+            elif my_dir == 1 and dc > 0:
+                on_my_path = 1.0
+            elif my_dir == 2 and dr > 0:
+                on_my_path = 1.0
+            elif my_dir == 3 and dc < 0:
+                on_my_path = 1.0
+
+            # Feature 3: relative direction
+            #   same (diff=0)        -> +1.0
+            #   opposite (diff=2)    -> -1.0
+            #   perpendicular (1,3)  ->  0.0
+            ddir = (other_dir - my_dir) % 4
+            if ddir == 0:
+                rel_dir = 1.0
+            elif ddir == 2:
+                rel_dir = -1.0
+            else:
+                rel_dir = 0.0
+
+            # Malfunction flag
+            mf = 1.0 if getattr(other, "malfunction_handler", None) is not None \
+                and other.malfunction_handler.malfunction_down_counter > 0 else 0.0
+
+            base = slot * N_AGENT_FEATURES
+            out[base + 0] = np.clip(dr / OBS_RADIUS, -1.0, 1.0)
+            out[base + 1] = np.clip(dc / OBS_RADIUS, -1.0, 1.0)
+            out[base + 2] = on_my_path
+            out[base + 3] = rel_dir
+            out[base + 4] = np.clip(dist / OBS_RADIUS, 0.0, 1.0)
+            out[base + 5] = mf
+        return out

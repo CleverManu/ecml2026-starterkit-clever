@@ -18,7 +18,8 @@ from flatland.envs.rail_env import RailEnv
 from flatland.envs.rewards import ECML2026Rewards
 
 from submission.my_observation_builder import (
-    MyObservationBuilder, MyObservationBuilderV2, MyObservationBuilderV3,
+    MyObservationBuilder, MyObservationBuilderV2,
+    MyObservationBuilderV3, MyObservationBuilderV4,
 )
 from training.sampling import sampling_env_generator
 
@@ -57,7 +58,9 @@ def make_training_env(
         is re-randomized on every reset to a uniform draw from that range.
         Useful when competition eval covers a wide span of agent counts.
     """
-    if obs_version == "v3":
+    if obs_version == "v4":
+        obs_builder = MyObservationBuilderV4()
+    elif obs_version == "v3":
         obs_builder = MyObservationBuilderV3()
     elif obs_version == "v2":
         obs_builder = MyObservationBuilderV2()

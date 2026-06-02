@@ -30,7 +30,9 @@ import numpy as np
 import torch
 
 from submission.model import ActorCritic, NetConfig, save_checkpoint, load_checkpoint
-from submission.my_observation_builder import get_obs_dim, get_obs_dim_v2, get_obs_dim_v3
+from submission.my_observation_builder import (
+    get_obs_dim, get_obs_dim_v2, get_obs_dim_v3, get_obs_dim_v4,
+)
 
 from training.env_factory import make_training_env, DEFAULT_SCENARIO
 from training.ppo import PPOConfig, PPOTrainer
@@ -49,11 +51,21 @@ def parse_args() -> argparse.Namespace:
                    help="Maximum waypoints per train (2 = simple A->B).")
     p.add_argument("--scene", type=str, default=None,
                    help="Station-set restriction: scene_1..scene_5 or omit for all.")
-    p.add_argument("--obs-version", type=str, default="v1", choices=["v1", "v2", "v3"],
+    p.add_argument("--obs-version", type=str, default="v1",
+                   choices=["v1", "v2", "v3", "v4"],
                    help="v1 = tree obs only (252 dims). "
                         "v2 = tree obs + 8 global features (260 dims). "
                         "v3 = v2 + 5 action-mask features at end (265 dims). "
-                        "Pick v3 if you want action masking; requires fresh training.")
+                        "v4 = v2 + nearest-K other-agent features + mask (283 dims). "
+                        "Pick v3 or v4 if you want action masking; both require "
+                        "fresh training (different obs_dim from each other).")
+    p.add_argument("--decision-points-only", action="store_true",
+                   help="If set, the policy is consulted only at decision-point "
+                        "cells (switches + nearby-agent events). Non-decision "
+                        "cells get a hard-coded MOVE_FORWARD/STOP based on the "
+                        "next cell's occupancy. Collapses effective episode "
+                        "length and sharpens credit assignment. Recommended "
+                        "with --obs-version v4.")
     p.add_argument("--use-action-mask", action="store_true",
                    help="Apply hard masking to invalid actions during training. "
                         "Recommended only with --obs-version v3 (so masking also "
@@ -125,18 +137,24 @@ def main() -> None:
     )
 
     # Resolve observation dim from the chosen builder version.
-    if args.obs_version == "v3":
+    if args.obs_version == "v4":
+        obs_dim = get_obs_dim_v4()
+    elif args.obs_version == "v3":
         obs_dim = get_obs_dim_v3()
     elif args.obs_version == "v2":
         obs_dim = get_obs_dim_v2()
     else:
         obs_dim = get_obs_dim()
 
-    if args.use_action_mask and args.obs_version != "v3":
+    if args.use_action_mask and args.obs_version not in ("v3", "v4"):
         print(f"WARNING: --use-action-mask with --obs-version {args.obs_version}: "
               f"masking will work during training but not at inference (the "
-              f"docker policy can't access the env). Use --obs-version v3 for "
-              f"consistent train/eval masking.")
+              f"docker policy can't access the env). Use --obs-version v3 or v4 "
+              f"for consistent train/eval masking.")
+    if args.decision_points_only and args.obs_version != "v4":
+        print(f"NOTE: --decision-points-only is supported with any obs version, "
+              f"but it's designed to work best with --obs-version v4 (which "
+              f"includes other-agent features). You're using {args.obs_version}.")
 
     if args.resume and os.path.isfile(args.resume):
         print(f"Resuming from {args.resume}")
@@ -170,6 +188,7 @@ def main() -> None:
             progress_reward_coef=args.shape_progress,
             arrival_bonus=args.arrival_bonus,
             use_action_mask=args.use_action_mask,
+            decision_points_only=args.decision_points_only,
             base_seed=args.seed,
         )
     else:
@@ -181,6 +200,7 @@ def main() -> None:
             progress_reward_coef=args.shape_progress,
             arrival_bonus=args.arrival_bonus,
             use_action_mask=args.use_action_mask,
+            decision_points_only=args.decision_points_only,
         )
     trainer = PPOTrainer(
         model=model,

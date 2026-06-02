@@ -101,6 +101,7 @@ def _worker_loop(
                 progress_coef: float = payload.get("progress_coef", 0.0)
                 arrival_bonus: float = payload.get("arrival_bonus", 0.0)
                 use_mask: bool = payload.get("use_action_mask", False)
+                dp_only: bool = payload.get("decision_points_only", False)
 
                 # Run the rollout and ship back the batch + episode metrics.
                 result = _collect(
@@ -108,6 +109,7 @@ def _worker_loop(
                     gamma=gamma, gae_lambda=gae_lambda,
                     reward_scale=reward_scale, progress_coef=progress_coef,
                     arrival_bonus=arrival_bonus, use_mask=use_mask,
+                    decision_points_only=dp_only,
                     obs_dict=obs_dict, info=info,
                     ep_return=ep_return, ep_length=ep_length,
                 )
@@ -139,11 +141,15 @@ def _worker_loop(
 
 def _collect(
     env, model, n_steps, gamma, gae_lambda, reward_scale, progress_coef,
-    arrival_bonus, use_mask,
+    arrival_bonus, use_mask, decision_points_only,
     obs_dict, info, ep_return, ep_length,
 ) -> Dict[str, Any]:
     """Pure rollout function used by workers. Mirrors RolloutCollector.collect."""
     from collections import defaultdict
+
+    # Lazy imports so workers only pay this cost when DP-mode is enabled.
+    if decision_points_only:
+        from submission.decision_point import is_decision_point, default_action
 
     traces = defaultdict(_PerAgentTrace)
     finished_advantages, finished_returns = [], []
@@ -164,11 +170,23 @@ def _collect(
 
     while steps_done < n_steps:
         handles = env.get_agent_handles()
-        need = [
+        need_action = [
             h for h in handles
             if obs_dict.get(h) is not None and info["action_required"][h]
         ]
+
+        # Decision-point gate (matches RolloutCollector.collect).
+        if decision_points_only:
+            need = [h for h in need_action if is_decision_point(env, h)]
+            hardcoded = [h for h in need_action if h not in need]
+        else:
+            need = need_action
+            hardcoded = []
+
         actions_dict: Dict[int, int] = {h: 0 for h in handles}
+        if hardcoded:
+            for h in hardcoded:
+                actions_dict[h] = default_action(env, h)
 
         if need:
             batch_obs = np.stack([np.asarray(obs_dict[h], dtype=np.float32) for h in need])
@@ -373,6 +391,7 @@ class ParallelRolloutCollector:
     progress_reward_coef: float = 0.0
     arrival_bonus: float = 0.0
     use_action_mask: bool = False
+    decision_points_only: bool = False
     base_seed: int = 0
 
     # Diagnostics filled in by each collect() call.
@@ -428,6 +447,7 @@ class ParallelRolloutCollector:
                 "progress_coef": self.progress_reward_coef,
                 "arrival_bonus": self.arrival_bonus,
                 "use_action_mask": self.use_action_mask,
+                "decision_points_only": self.decision_points_only,
             }))
 
         # 3. Drain results.
