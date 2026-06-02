@@ -215,7 +215,7 @@ class MyObservationBuilderV2(MyObservationBuilder):
         7. malfunction time remaining for this agent / 50.0 (capped at 1.0)
 
     All values are clipped to ``[-1, 1]``. Use this builder by setting the
-    Docker env var ``OBS_BUILDER=my_orga.my_observation_builder.MyObservationBuilderV2``.
+    Docker env var ``OBS_BUILDER=submission.my_observation_builder.MyObservationBuilderV2``.
     """
 
     def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:
@@ -291,7 +291,7 @@ class MyObservationBuilderV3(MyObservationBuilderV2):
 
     The trainer extracts these features back into a bool mask and applies
     them in the categorical's logits, both during action selection and during
-    the PPO update. Inference (:class:`my_orga.my_policy.MyPolicy`) does the
+    the PPO update. Inference (:class:`submission.my_policy.MyPolicy`) does the
     same extraction, so masking is consistent across train and eval without
     needing env access at inference time.
     """
@@ -299,7 +299,7 @@ class MyObservationBuilderV3(MyObservationBuilderV2):
     def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:
         # Late import to avoid a cycle (action_mask -> obs_builder is fine,
         # but obs_builder -> action_mask only when v3 is used).
-        from my_orga.action_mask import get_action_mask
+        from submission.action_mask import get_action_mask
 
         v2_part = super().get(handle)
         mask = get_action_mask(self.env, handle).astype(np.float32)
@@ -376,7 +376,7 @@ class MyObservationBuilderV4(MyObservationBuilderV2):
     """
 
     def get(self, handle: Optional[AgentHandle] = 0) -> np.ndarray:
-        from my_orga.action_mask import get_action_mask
+        from submission.action_mask import get_action_mask
 
         v2_part = super().get(handle)  # (260,)
         agent_part = self._nearest_agent_features(handle)  # (K*6,)
