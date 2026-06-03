@@ -24,12 +24,17 @@ warnings.filterwarnings("ignore", message=".*Could not find path.*")
 import argparse
 import os
 import time
+from typing import Optional
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from submission.model import ActorCritic, NetConfig, save_checkpoint, load_checkpoint
+from submission.model import (
+    ActorCritic, CentralizedCritic, CriticConfig, NetConfig,
+    save_checkpoint, load_checkpoint,
+    save_mappo_checkpoint, load_mappo_checkpoint, get_global_state_dim,
+)
 from submission.my_observation_builder import (
     get_obs_dim, get_obs_dim_v2, get_obs_dim_v3, get_obs_dim_v4,
 )
@@ -70,6 +75,16 @@ def parse_args() -> argparse.Namespace:
                    help="Apply hard masking to invalid actions during training. "
                         "Recommended only with --obs-version v3 (so masking also "
                         "works at evaluation time).")
+    p.add_argument("--mappo", action="store_true",
+                   help="Use a centralized critic (MAPPO) for value estimates. "
+                        "Policy stays decentralized (deployed as-is at inference). "
+                        "Critic sees a pooled global summary of all agent obs + "
+                        "env scalars. Significantly improves credit assignment "
+                        "in cooperative MARL.")
+    p.add_argument("--critic-lr", type=float, default=3e-4,
+                   help="Learning rate for the centralized critic (MAPPO only).")
+    p.add_argument("--critic-hidden", type=int, default=256,
+                   help="Hidden width of the centralized critic (MAPPO only).")
     p.add_argument("--arrival-bonus", type=float, default=0.0,
                    help="Raw-units reward given on the step an agent reaches its "
                         "target. Dense positive feedback for the actual success "
@@ -156,18 +171,33 @@ def main() -> None:
               f"but it's designed to work best with --obs-version v4 (which "
               f"includes other-agent features). You're using {args.obs_version}.")
 
+    critic: Optional[CentralizedCritic] = None
     if args.resume and os.path.isfile(args.resume):
         print(f"Resuming from {args.resume}")
-        model = load_checkpoint(args.resume, map_location="cpu")
+        model, loaded_critic = load_mappo_checkpoint(args.resume, map_location="cpu")
         if model.cfg.obs_dim != obs_dim:
             raise SystemExit(
                 f"Checkpoint obs_dim={model.cfg.obs_dim} doesn't match selected "
                 f"--obs-version (gives {obs_dim}). To resume, match the obs "
                 f"version used during the original training run."
             )
+        if args.mappo:
+            critic = loaded_critic  # may be None if resumed from non-MAPPO checkpoint
+            if critic is None:
+                print("--mappo set but resumed checkpoint has no critic; "
+                      "creating a fresh one (it will need to warm up).")
     else:
         model = ActorCritic(NetConfig(obs_dim=obs_dim, hidden=args.hidden))
     model.to("cpu").train()
+
+    if args.mappo and critic is None:
+        global_state_dim = get_global_state_dim(obs_dim)
+        critic = CentralizedCritic(CriticConfig(
+            global_state_dim=global_state_dim,
+            hidden=args.critic_hidden,
+        ))
+    if critic is not None:
+        critic.to("cpu").train()
 
     # Single env (for setup info) + collector selection.
     setup_env = make_training_env(**env_kwargs)
@@ -175,14 +205,15 @@ def main() -> None:
     print(f"Env: {setup_env.width}x{setup_env.height}, n_agents={setup_env.get_num_agents()}, "
           f"obs_dim={obs_dim}, max_episode_steps={setup_env._max_episode_steps}, "
           f"num_envs={args.num_envs}, n_agents_range={args.n_agents_range}, "
-          f"action_mask={args.use_action_mask}")
+          f"action_mask={args.use_action_mask}, mappo={args.mappo}"
+          + (f" (critic global_state_dim={critic.cfg.global_state_dim})" if critic else ""))
     del setup_env
 
     if args.num_envs > 1:
         from training.parallel_rollout import ParallelRolloutCollector
         collector = ParallelRolloutCollector(
             n_envs=args.num_envs, env_kwargs=env_kwargs,
-            model=model, rollout_steps=args.rollout_steps,
+            model=model, critic=critic, rollout_steps=args.rollout_steps,
             gamma=args.gamma, gae_lambda=args.gae_lambda,
             reward_scale=args.reward_scale,
             progress_reward_coef=args.shape_progress,
@@ -194,7 +225,7 @@ def main() -> None:
     else:
         collector = RolloutCollector(
             env=make_training_env(**env_kwargs),
-            model=model, rollout_steps=args.rollout_steps,
+            model=model, critic=critic, rollout_steps=args.rollout_steps,
             gamma=args.gamma, gae_lambda=args.gae_lambda,
             reward_scale=args.reward_scale,
             progress_reward_coef=args.shape_progress,
@@ -203,9 +234,10 @@ def main() -> None:
             decision_points_only=args.decision_points_only,
         )
     trainer = PPOTrainer(
-        model=model,
+        model=model, critic=critic,
         cfg=PPOConfig(
-            lr=args.lr, clip_eps=args.clip_eps,
+            lr=args.lr, critic_lr=args.critic_lr,
+            clip_eps=args.clip_eps,
             value_coef=args.value_coef, entropy_coef=args.entropy_coef,
             epochs=args.epochs, minibatch_size=args.minibatch_size,
         ),
@@ -266,17 +298,17 @@ def main() -> None:
 
             if update_idx % args.checkpoint_every == 0:
                 path = ckpt_dir / f"ckpt_upd{update_idx:05d}.pt"
-                save_checkpoint(model, str(path),
-                                extra={"global_step": global_step, "update": update_idx})
+                save_mappo_checkpoint(model, critic, str(path),
+                                      extra={"global_step": global_step, "update": update_idx})
                 # Also overwrite latest.pt for convenience.
-                save_checkpoint(model, str(ckpt_dir / "latest.pt"),
-                                extra={"global_step": global_step, "update": update_idx})
+                save_mappo_checkpoint(model, critic, str(ckpt_dir / "latest.pt"),
+                                      extra={"global_step": global_step, "update": update_idx})
                 print(f"  saved {path}")
 
             if collector.success_rates and succ > best_success_rate:
                 best_success_rate = succ
-                save_checkpoint(
-                    model, str(ckpt_dir / "best.pt"),
+                save_mappo_checkpoint(
+                    model, critic, str(ckpt_dir / "best.pt"),
                     extra={"global_step": global_step, "update": update_idx,
                            "success_rate": succ},
                 )
@@ -286,8 +318,8 @@ def main() -> None:
         # transient pipe errors, etc. The user can resume from emergency.pt.
         emergency_path = ckpt_dir / "emergency.pt"
         try:
-            save_checkpoint(
-                model, str(emergency_path),
+            save_mappo_checkpoint(
+                model, critic, str(emergency_path),
                 extra={"global_step": global_step, "update": update_idx,
                        "crashed": True, "reason": type(e).__name__},
             )
@@ -304,8 +336,8 @@ def main() -> None:
         raise
 
     # Final save
-    save_checkpoint(model, str(ckpt_dir / "final.pt"),
-                    extra={"global_step": global_step, "update": update_idx})
+    save_mappo_checkpoint(model, critic, str(ckpt_dir / "final.pt"),
+                          extra={"global_step": global_step, "update": update_idx})
     print(f"Done. Final checkpoint -> {ckpt_dir / 'final.pt'}")
     if best_success_rate >= 0:
         print(f"Best success rate during training: {best_success_rate:.2%}")

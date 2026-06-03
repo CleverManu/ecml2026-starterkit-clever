@@ -23,8 +23,9 @@ import torch
 from flatland.envs.rail_env import RailEnv
 
 from submission.action_mask import get_action_mask
-from submission.model import ActorCritic
+from submission.model import ActorCritic, CentralizedCritic
 from submission.my_observation_builder import extract_mask_from_obs
+from training.global_state import compute_global_state
 
 
 @dataclass
@@ -37,6 +38,10 @@ class Batch:
     advantages: torch.Tensor
     returns: torch.Tensor
     action_masks: Optional[torch.Tensor] = None  # (N, 5) bool; None = no masking
+    # MAPPO addition: per-sample global state. None for vanilla PPO.
+    # Shape: (N, global_state_dim). The same global state is replicated
+    # across each agent that produced a decision at that step.
+    global_states: Optional[torch.Tensor] = None
 
     def __len__(self) -> int:
         return self.obs.shape[0]
@@ -50,6 +55,8 @@ class _PerAgentTrace:
     values: List[float] = field(default_factory=list)
     rewards: List[float] = field(default_factory=list)
     masks: List[np.ndarray] = field(default_factory=list)
+    # MAPPO: snapshot of global state at the moment this action was taken.
+    global_states: List[np.ndarray] = field(default_factory=list)
 
 
 def _compute_gae(rewards: List[float], values: List[float], last_value: float,
@@ -73,6 +80,10 @@ class RolloutCollector:
     env: RailEnv
     model: ActorCritic
     rollout_steps: int
+    # If set, use this centralized critic for value estimates instead of the
+    # policy's value head. Enables MAPPO training -- the critic sees the global
+    # state and produces much cleaner value targets in dense MARL settings.
+    critic: Optional["CentralizedCritic"] = None
     gamma: float = 0.99
     gae_lambda: float = 0.95
     reward_scale: float = 100.0  # ECML2026Rewards has very large terminal penalties;
@@ -99,6 +110,7 @@ class RolloutCollector:
         finished_advantages, finished_returns = [], []
         finished_obs, finished_actions, finished_log_probs, finished_values = [], [], [], []
         finished_masks: List[np.ndarray] = []
+        finished_global_states: List[np.ndarray] = []  # MAPPO; empty when no critic
 
         self.episode_returns = []
         self.episode_lengths = []
@@ -168,6 +180,18 @@ class RolloutCollector:
                     sampled = dist.sample()
                     log_probs = dist.log_prob(sampled)
 
+                # MAPPO: replace per-agent policy value with the centralized
+                # critic's value of the *global state*. Same scalar replicated
+                # to each deciding agent because they share the world state.
+                step_global_state = None
+                if self.critic is not None:
+                    step_global_state = compute_global_state(self.env, obs_dict)
+                    gs_t = torch.from_numpy(step_global_state).unsqueeze(0).to(self.device)
+                    with torch.no_grad():
+                        cv = self.critic(gs_t)  # shape (1,)
+                    central_value = float(cv.item())
+                    values_t = torch.full_like(values_t, central_value)
+
                 sampled_np = sampled.cpu().numpy()
                 log_probs_np = log_probs.cpu().numpy()
                 values_np = values_t.cpu().numpy()
@@ -181,6 +205,8 @@ class RolloutCollector:
                     tr.values.append(float(values_np[j]))
                     if batch_masks is not None:
                         tr.masks.append(batch_masks[j])
+                    if step_global_state is not None:
+                        tr.global_states.append(step_global_state)
 
             next_obs, rewards, dones, next_info = self.env.step(actions_dict)
             steps_done += 1
@@ -245,7 +271,7 @@ class RolloutCollector:
                         tr, last_value=0.0,
                         bufs=(finished_obs, finished_actions, finished_log_probs,
                               finished_values, finished_advantages, finished_returns,
-                              finished_masks),
+                              finished_masks, finished_global_states),
                     )
                 traces = defaultdict(_PerAgentTrace)
                 if steps_done < self.rollout_steps:
@@ -255,21 +281,34 @@ class RolloutCollector:
                     prev_done = {a.handle: (a.state == 6) for a in self.env.agents}
 
         # End of rollout window: bootstrap unfinished traces from current value estimate.
+        # With MAPPO, the bootstrap value comes from the centralized critic on the
+        # current global state -- one scalar shared by every unfinished agent. Without
+        # the critic, we bootstrap per-agent from the policy's value head as before.
+        bootstrap_central = None
+        if self.critic is not None and traces:
+            gs_now = compute_global_state(self.env, obs_dict)
+            with torch.no_grad():
+                bootstrap_central = float(self.critic(
+                    torch.from_numpy(gs_now).unsqueeze(0).to(self.device)
+                ).item())
         for h, tr in traces.items():
             if not tr.actions:
                 continue
-            last_value = 0.0
-            obs_h = obs_dict.get(h)
-            if obs_h is not None:
-                with torch.no_grad():
-                    _, v = self.model(torch.from_numpy(
-                        np.asarray(obs_h, dtype=np.float32)).unsqueeze(0).to(self.device))
-                    last_value = float(v.item())
+            if bootstrap_central is not None:
+                last_value = bootstrap_central
+            else:
+                last_value = 0.0
+                obs_h = obs_dict.get(h)
+                if obs_h is not None:
+                    with torch.no_grad():
+                        _, v = self.model(torch.from_numpy(
+                            np.asarray(obs_h, dtype=np.float32)).unsqueeze(0).to(self.device))
+                        last_value = float(v.item())
             self._flush(
                 tr, last_value=last_value,
                 bufs=(finished_obs, finished_actions, finished_log_probs,
                       finished_values, finished_advantages, finished_returns,
-                      finished_masks),
+                      finished_masks, finished_global_states),
             )
 
         obs_arr = np.concatenate(finished_obs) if finished_obs else np.zeros((0, self.model.cfg.obs_dim), dtype=np.float32)
@@ -282,6 +321,10 @@ class RolloutCollector:
         if self.use_action_mask and finished_masks:
             masks_arr = np.concatenate(finished_masks)
             masks_t = torch.from_numpy(masks_arr.astype(np.bool_))
+        gs_t = None
+        if self.critic is not None and finished_global_states:
+            gs_arr = np.concatenate(finished_global_states)
+            gs_t = torch.from_numpy(gs_arr.astype(np.float32))
 
         return Batch(
             obs=torch.from_numpy(obs_arr),
@@ -291,6 +334,7 @@ class RolloutCollector:
             advantages=torch.from_numpy(advantages_arr.astype(np.float32)),
             returns=torch.from_numpy(returns_arr.astype(np.float32)),
             action_masks=masks_t,
+            global_states=gs_t,
         )
 
     def _flush(self, tr: _PerAgentTrace, last_value: float, bufs) -> None:
@@ -300,7 +344,7 @@ class RolloutCollector:
             tr.rewards.append(0.0)
         adv, ret = _compute_gae(tr.rewards, tr.values, last_value,
                                 self.gamma, self.gae_lambda)
-        (b_obs, b_act, b_lp, b_val, b_adv, b_ret, b_mask) = bufs
+        (b_obs, b_act, b_lp, b_val, b_adv, b_ret, b_mask, b_gs) = bufs
         b_obs.append(np.stack(tr.obs).astype(np.float32))
         b_act.append(np.asarray(tr.actions, dtype=np.int64))
         b_lp.append(np.asarray(tr.log_probs, dtype=np.float32))
@@ -309,6 +353,8 @@ class RolloutCollector:
         b_ret.append(ret.astype(np.float32))
         if tr.masks:
             b_mask.append(np.stack(tr.masks).astype(np.bool_))
+        if tr.global_states:
+            b_gs.append(np.stack(tr.global_states).astype(np.float32))
 
     def _distances_to_target(self) -> Dict[int, float]:
         """Read each active agent's shortest-path distance to its target."""

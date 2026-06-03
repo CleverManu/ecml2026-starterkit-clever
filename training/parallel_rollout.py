@@ -26,21 +26,23 @@ import gc
 import os
 from dataclasses import dataclass, field
 from multiprocessing import Pipe, Process
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.multiprocessing import set_start_method as _set_start_method
 
 from submission.action_mask import get_action_mask
-from submission.model import ActorCritic, NetConfig
+from submission.model import ActorCritic, CentralizedCritic, CriticConfig, NetConfig
 from submission.my_observation_builder import extract_mask_from_obs
 from training.env_factory import make_training_env
+from training.global_state import compute_global_state
 from training.rollout import Batch, _PerAgentTrace, _compute_gae
 
 
 # Workers communicate via simple (command, payload) tuples on a Pipe.
 CMD_SET_WEIGHTS = "set_weights"
+CMD_SET_CRITIC_WEIGHTS = "set_critic_weights"
 CMD_COLLECT = "collect"
 CMD_CLOSE = "close"
 
@@ -59,8 +61,14 @@ def _worker_loop(
     env_kwargs: Dict[str, Any],
     model_cfg: Dict[str, Any],
     seed: int,
+    critic_cfg: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Entry point for each parallel rollout worker."""
+    """Entry point for each parallel rollout worker.
+
+    If ``critic_cfg`` is provided, the worker also builds a CentralizedCritic
+    and listens for the new ``CMD_SET_CRITIC_WEIGHTS`` command. The critic is
+    used during _collect to produce centralized value estimates per step.
+    """
     try:
         torch.set_num_threads(1)  # Each worker uses one thread; we get parallelism from processes.
         np.random.seed(seed)
@@ -73,6 +81,11 @@ def _worker_loop(
 
         model = ActorCritic(NetConfig(**model_cfg))
         model.eval()
+
+        critic: Optional[CentralizedCritic] = None
+        if critic_cfg is not None:
+            critic = CentralizedCritic(CriticConfig(**critic_cfg))
+            critic.eval()
 
         # State carried across collect() calls: the current obs + info, the
         # in-flight per-agent traces and episode-level accumulators. This is
@@ -93,6 +106,11 @@ def _worker_loop(
                 model.load_state_dict(payload)
                 conn.send("ok")
 
+            elif cmd == CMD_SET_CRITIC_WEIGHTS:
+                if critic is not None:
+                    critic.load_state_dict(payload)
+                conn.send("ok")
+
             elif cmd == CMD_COLLECT:
                 n_steps: int = payload["n_steps"]
                 gamma: float = payload["gamma"]
@@ -105,7 +123,7 @@ def _worker_loop(
 
                 # Run the rollout and ship back the batch + episode metrics.
                 result = _collect(
-                    env=env, model=model, n_steps=n_steps,
+                    env=env, model=model, critic=critic, n_steps=n_steps,
                     gamma=gamma, gae_lambda=gae_lambda,
                     reward_scale=reward_scale, progress_coef=progress_coef,
                     arrival_bonus=arrival_bonus, use_mask=use_mask,
@@ -140,11 +158,15 @@ def _worker_loop(
 
 
 def _collect(
-    env, model, n_steps, gamma, gae_lambda, reward_scale, progress_coef,
+    env, model, critic, n_steps, gamma, gae_lambda, reward_scale, progress_coef,
     arrival_bonus, use_mask, decision_points_only,
     obs_dict, info, ep_return, ep_length,
 ) -> Dict[str, Any]:
-    """Pure rollout function used by workers. Mirrors RolloutCollector.collect."""
+    """Pure rollout function used by workers. Mirrors RolloutCollector.collect.
+
+    When ``critic`` is not None, value estimates come from the centralized
+    critic on a pooled global state computed each step.
+    """
     from collections import defaultdict
 
     # Lazy imports so workers only pay this cost when DP-mode is enabled.
@@ -155,6 +177,7 @@ def _collect(
     finished_advantages, finished_returns = [], []
     finished_obs, finished_actions, finished_log_probs, finished_values = [], [], [], []
     finished_masks: List[np.ndarray] = []
+    finished_global_states: List[np.ndarray] = []  # MAPPO only
 
     episode_returns: List[float] = []
     episode_lengths: List[int] = []
@@ -209,6 +232,16 @@ def _collect(
                 dist = torch.distributions.Categorical(logits=logits)
                 sampled = dist.sample()
                 log_probs = dist.log_prob(sampled)
+
+            # MAPPO: override values with centralized critic on global state.
+            step_global_state = None
+            if critic is not None:
+                step_global_state = compute_global_state(env, obs_dict)
+                gs_t = torch.from_numpy(step_global_state).unsqueeze(0)
+                with torch.no_grad():
+                    cv = critic(gs_t)
+                values_t = torch.full_like(values_t, float(cv.item()))
+
             sampled_np = sampled.numpy()
             log_probs_np = log_probs.numpy()
             values_np = values_t.numpy()
@@ -221,6 +254,8 @@ def _collect(
                 tr.values.append(float(values_np[j]))
                 if batch_masks is not None:
                     tr.masks.append(batch_masks[j])
+                if step_global_state is not None:
+                    tr.global_states.append(step_global_state)
 
         next_obs, rewards, dones, next_info = env.step(actions_dict)
         steps_done += 1
@@ -271,7 +306,7 @@ def _collect(
                                   finished_obs, finished_actions,
                                   finished_log_probs, finished_values,
                                   finished_advantages, finished_returns,
-                                  finished_masks)
+                                  finished_masks, finished_global_states)
             traces = defaultdict(_PerAgentTrace)
 
             if steps_done < n_steps:
@@ -280,22 +315,34 @@ def _collect(
                     prev_distance = _distances_to_target(env)
                 prev_done = {a.handle: (a.state == 6) for a in env.agents}
 
-    # Bootstrap partial traces at end of rollout window.
+    # Bootstrap partial traces at end of rollout window. With MAPPO, the
+    # bootstrap value comes from the centralized critic on the current global
+    # state (one scalar shared across all unfinished agents).
+    bootstrap_central = None
+    if critic is not None and traces:
+        gs_now = compute_global_state(env, obs_dict)
+        with torch.no_grad():
+            bootstrap_central = float(critic(
+                torch.from_numpy(gs_now).unsqueeze(0)
+            ).item())
     for h, tr in traces.items():
         if not tr.actions:
             continue
-        last_value = 0.0
-        obs_h = obs_dict.get(h)
-        if obs_h is not None:
-            with torch.no_grad():
-                _, v = model(torch.from_numpy(
-                    np.asarray(obs_h, dtype=np.float32)).unsqueeze(0))
-                last_value = float(v.item())
+        if bootstrap_central is not None:
+            last_value = bootstrap_central
+        else:
+            last_value = 0.0
+            obs_h = obs_dict.get(h)
+            if obs_h is not None:
+                with torch.no_grad():
+                    _, v = model(torch.from_numpy(
+                        np.asarray(obs_h, dtype=np.float32)).unsqueeze(0))
+                    last_value = float(v.item())
         _flush_to_buffers(tr, last_value, gamma, gae_lambda,
                           finished_obs, finished_actions,
                           finished_log_probs, finished_values,
                           finished_advantages, finished_returns,
-                          finished_masks)
+                          finished_masks, finished_global_states)
 
     # See the matching block in RolloutCollector.collect: reset if env ended
     # exactly on the rollout boundary so next collect() can step.
@@ -319,6 +366,8 @@ def _collect(
                    else np.zeros(0, dtype=np.float32))
     masks_arr = (np.concatenate(finished_masks)
                  if (use_mask and finished_masks) else None)
+    gs_arr = (np.concatenate(finished_global_states)
+              if (critic is not None and finished_global_states) else None)
 
     return {
         "batch": {
@@ -328,6 +377,7 @@ def _collect(
             "advantages": advantages_arr.astype(np.float32),
             "returns": returns_arr.astype(np.float32),
             "masks": masks_arr.astype(np.bool_) if masks_arr is not None else None,
+            "global_states": gs_arr.astype(np.float32) if gs_arr is not None else None,
         },
         "obs_dict": obs_dict, "info": info,
         "ep_return": ep_return, "ep_length": ep_length,
@@ -338,7 +388,7 @@ def _collect(
 
 
 def _flush_to_buffers(tr, last_value, gamma, gae_lambda,
-                     b_obs, b_act, b_lp, b_val, b_adv, b_ret, b_mask):
+                     b_obs, b_act, b_lp, b_val, b_adv, b_ret, b_mask, b_gs):
     while len(tr.rewards) < len(tr.actions):
         tr.rewards.append(0.0)
     adv, ret = _compute_gae(tr.rewards, tr.values, last_value, gamma, gae_lambda)
@@ -350,6 +400,8 @@ def _flush_to_buffers(tr, last_value, gamma, gae_lambda,
     b_ret.append(ret.astype(np.float32))
     if tr.masks:
         b_mask.append(np.stack(tr.masks).astype(np.bool_))
+    if tr.global_states:
+        b_gs.append(np.stack(tr.global_states).astype(np.float32))
 
 
 def _distances_to_target(env) -> Dict[int, float]:
@@ -385,6 +437,8 @@ class ParallelRolloutCollector:
     env_kwargs: Dict[str, Any]
     model: ActorCritic
     rollout_steps: int
+    # MAPPO: optional centralized critic. None for vanilla PPO.
+    critic: Optional[CentralizedCritic] = None
     gamma: float = 0.99
     gae_lambda: float = 0.95
     reward_scale: float = 100.0
@@ -415,11 +469,18 @@ class ParallelRolloutCollector:
             "hidden": self.model.cfg.hidden,
             "n_actions": self.model.cfg.n_actions,
         }
+        critic_cfg = None
+        if self.critic is not None:
+            critic_cfg = {
+                "global_state_dim": self.critic.cfg.global_state_dim,
+                "hidden": self.critic.cfg.hidden,
+            }
         for i in range(self.n_envs):
             parent, child = Pipe(duplex=True)
             p = Process(
                 target=_worker_loop,
-                args=(child, i, dict(self.env_kwargs), model_cfg, self.base_seed + i * 1000),
+                args=(child, i, dict(self.env_kwargs), model_cfg,
+                      self.base_seed + i * 1000, critic_cfg),
                 daemon=True,
             )
             p.start()
@@ -435,6 +496,16 @@ class ParallelRolloutCollector:
             ack = conn.recv()
             if isinstance(ack, tuple) and ack[0] == "error":
                 raise RuntimeError(f"Worker error during set_weights: {ack[1]}")
+
+        # 1b. Broadcast critic weights too if running MAPPO.
+        if self.critic is not None:
+            csd = _serialize_state_dict(self.critic.state_dict())
+            for conn in self._parents:
+                conn.send((CMD_SET_CRITIC_WEIGHTS, csd))
+            for conn in self._parents:
+                ack = conn.recv()
+                if isinstance(ack, tuple) and ack[0] == "error":
+                    raise RuntimeError(f"Worker error during set_critic_weights: {ack[1]}")
 
         # 2. Kick off parallel collection.
         per_worker = max(1, self.rollout_steps // self.n_envs)
@@ -475,7 +546,7 @@ class ParallelRolloutCollector:
             if not parts:
                 if key == "obs":
                     return np.zeros((0, self.model.cfg.obs_dim), dtype=dtype)
-                if key == "masks":
+                if key in ("masks", "global_states"):
                     return None
                 return np.zeros(0, dtype=dtype)
             return np.concatenate(parts, axis=0)
@@ -483,6 +554,9 @@ class ParallelRolloutCollector:
         masks_arr = None
         if self.use_action_mask:
             masks_arr = _cat("masks", np.bool_)
+        gs_arr = None
+        if self.critic is not None:
+            gs_arr = _cat("global_states", np.float32)
 
         return Batch(
             obs=torch.from_numpy(_cat("obs", np.float32)),
@@ -492,6 +566,7 @@ class ParallelRolloutCollector:
             advantages=torch.from_numpy(_cat("advantages", np.float32)),
             returns=torch.from_numpy(_cat("returns", np.float32)),
             action_masks=torch.from_numpy(masks_arr) if masks_arr is not None else None,
+            global_states=torch.from_numpy(gs_arr) if gs_arr is not None else None,
         )
 
     def close(self) -> None:

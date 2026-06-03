@@ -125,3 +125,112 @@ def load_checkpoint(path: str, map_location: str = "cpu") -> ActorCritic:
     model.load_state_dict(payload["state_dict"])
     model.eval()
     return model
+
+
+# ---------------------------------------------------------------------------
+# MAPPO: centralized critic.
+# ---------------------------------------------------------------------------
+# The critic is *only* used during training. At inference we deploy the
+# decentralized policy alone (ActorCritic.policy_head + trunk), which is what
+# the Docker image ships.
+#
+# Pooled global state layout (see training/global_state.py):
+#   [mean over agents of per-agent obs] (obs_dim,)
+#   [max over agents of per-agent obs]  (obs_dim,)
+#   [env-level scalars]                 (N_ENV_SCALARS,)
+# => total dim: 2 * obs_dim + N_ENV_SCALARS
+#
+# A separate value network rather than a head on the shared trunk: the trunk
+# is sized for per-agent obs (~283 dims); the global state is much bigger
+# (~575 dims). Sharing trunks would force compromises.
+
+N_ENV_SCALARS: int = 6  # see global_state.compute_global_state
+
+
+def get_global_state_dim(obs_dim: int) -> int:
+    """Dim of the pooled global state (option a)."""
+    return 2 * obs_dim + N_ENV_SCALARS
+
+
+@dataclass
+class CriticConfig:
+    global_state_dim: int
+    hidden: int = 256
+
+
+class CentralizedCritic(nn.Module):
+    """Standalone value network operating on a global state.
+
+    Two-layer Tanh MLP, deliberately matching the policy's architecture style
+    so the gradient scales stay similar. Outputs a single scalar value used as
+    the value estimate for every agent's per-step advantage computation -- the
+    "centralized value" of MAPPO.
+    """
+
+    def __init__(self, cfg: CriticConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.trunk = nn.Sequential(
+            _orthogonal_init(nn.Linear(cfg.global_state_dim, cfg.hidden), gain=2.0 ** 0.5),
+            nn.Tanh(),
+            _orthogonal_init(nn.Linear(cfg.hidden, cfg.hidden), gain=2.0 ** 0.5),
+            nn.Tanh(),
+        )
+        self.value_head = _orthogonal_init(nn.Linear(cfg.hidden, 1), gain=1.0)
+
+    def forward(self, global_state: torch.Tensor) -> torch.Tensor:
+        """Return scalar value per global-state row. Shape: (batch,)."""
+        return self.value_head(self.trunk(global_state)).squeeze(-1)
+
+
+def save_mappo_checkpoint(
+    policy: ActorCritic,
+    critic: Optional[CentralizedCritic],
+    path: str,
+    extra: Optional[dict] = None,
+) -> None:
+    """Persist both the policy and the centralized critic (if present).
+
+    Compatible with :func:`load_checkpoint` for backward compatibility:
+    callers that don't care about the critic will just load the policy half.
+    """
+    payload = {
+        "state_dict": policy.state_dict(),
+        "config": {
+            "obs_dim": policy.cfg.obs_dim,
+            "hidden": policy.cfg.hidden,
+            "n_actions": policy.cfg.n_actions,
+        },
+    }
+    if critic is not None:
+        payload["critic_state_dict"] = critic.state_dict()
+        payload["critic_config"] = {
+            "global_state_dim": critic.cfg.global_state_dim,
+            "hidden": critic.cfg.hidden,
+        }
+    if extra:
+        payload["extra"] = extra
+    torch.save(payload, path)
+
+
+def load_mappo_checkpoint(
+    path: str, map_location: str = "cpu"
+) -> Tuple[ActorCritic, Optional[CentralizedCritic]]:
+    """Load both policy + critic. Critic is None if absent from the file.
+
+    Falls back to behaving like :func:`load_checkpoint` if the file was saved
+    without a critic (e.g. by an older training run).
+    """
+    payload = torch.load(path, map_location=map_location, weights_only=False)
+    cfg = NetConfig(**payload["config"])
+    policy = ActorCritic(cfg)
+    policy.load_state_dict(payload["state_dict"])
+    policy.eval()
+
+    critic = None
+    if "critic_state_dict" in payload:
+        c_cfg = CriticConfig(**payload["critic_config"])
+        critic = CentralizedCritic(c_cfg)
+        critic.load_state_dict(payload["critic_state_dict"])
+        critic.eval()
+    return policy, critic
